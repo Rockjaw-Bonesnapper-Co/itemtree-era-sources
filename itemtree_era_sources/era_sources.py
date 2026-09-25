@@ -401,10 +401,17 @@ PIN_TENTHS = 10
 # agreed. pfQuest is a CHECK and nothing else: no pfQuest coordinate is shipped.
 PIN_AGREEMENT = 0.5
 
-# A UiMap.Type of 3 is a zone map, which is the only kind a pin is ever drawn on. This build
-# ships no dungeon and no micro map at all (there is not one Type 0, 4, 5 or 6 row), so a
-# creature inside an instance can never have a pin whatever is computed for it.
+# The UiMap types a pin is drawn on, named as the client's Enum.UIMapType names them
+# (Blizzard_APIDocumentationGenerated/MapConstantsDocumentation.lua, Forever branch of the
+# wow-ui-source mirror). Type 3 is Zone. Type 6 is Orphan, a map with its own art that the
+# world map does not reach by drilling down from a continent: 1.60.1.70009 retyped Alterac
+# Valley (1459), Arathi Basin (1461), Warsong Gulch (1460) and Darkspear Islands (2524) from
+# Zone to Orphan with the same UiMapAssignment bounds, and dropping them lost Alterac Valley's
+# 154 pins. Dungeon (4) and Micro (5) stay excluded: the Forever builds ship none so far, and
+# a creature inside an instance keeps the instance area answer instead of a pin.
 UI_MAP_TYPE_ZONE = 3
+UI_MAP_TYPE_ORPHAN = 6
+PIN_MAP_TYPES = frozenset({UI_MAP_TYPE_ZONE, UI_MAP_TYPE_ORPHAN})
 
 # ----- the instance areas -------------------------------------------------------------------
 #
@@ -1266,14 +1273,14 @@ def _map_table(conn: sqlite3.Connection, build: str, table: str, columns: str) -
 def map_bounds(conn: sqlite3.Connection, build: str) -> dict[tuple[int, int], MapBounds]:
     """(zone UiMap id, continent map id) -> where that zone map's corners sit in the world.
 
-    Only a zone map (`UiMap.Type` 3) is kept. This build ships no dungeon and no micro map at
-    all, so a spawn on an instance's own map id finds no bounds here and gets no pin, which is
-    the honest answer: there is no map to draw it on.
+    Only a Zone (`UiMap.Type` 3) or Orphan (Type 6) map is kept, see PIN_MAP_TYPES. The Forever
+    builds ship no Dungeon map, so a spawn on an instance's own map id finds no bounds here and
+    gets no pin, which is the honest answer: there is no map to draw it on.
     """
     zone_maps = {
         int(row["ID"])
         for row in _map_table(conn, build, "UiMap", "ID, Type")
-        if int(row["Type"] or 0) == UI_MAP_TYPE_ZONE
+        if int(row["Type"] or 0) in PIN_MAP_TYPES
     }
     out: dict[tuple[int, int], MapBounds] = {}
     columns = "UiMapID, MapID, Region_0, Region_1, Region_3, Region_4, UiMin_0, UiMin_1, UiMax_0, UiMax_1"
@@ -1302,7 +1309,7 @@ def map_bounds(conn: sqlite3.Connection, build: str) -> dict[tuple[int, int], Ma
 
 
 def area_maps(conn: sqlite3.Connection, build: str, areas: Mapping[int, str]) -> dict[int, int]:
-    """areaId -> the zone level UiMap id THIS build draws that area on.
+    """areaId -> the Zone or Orphan UiMap id THIS build draws that area on (see PIN_MAP_TYPES).
 
     Three lookups, in this order, which is the order that works on this build: the area is the
     root area of a zone map's own `UiMapAssignment` row; or a `WorldMapOverlay` names it among
@@ -1315,7 +1322,7 @@ def area_maps(conn: sqlite3.Connection, build: str, areas: Mapping[int, str]) ->
     zone_maps = {
         int(row["ID"])
         for row in _map_table(conn, build, "UiMap", "ID, Type")
-        if int(row["Type"] or 0) == UI_MAP_TYPE_ZONE
+        if int(row["Type"] or 0) in PIN_MAP_TYPES
     }
     direct: dict[int, int] = {}
     for row in _map_table(conn, build, "UiMapAssignment", "UiMapID, AreaID"):
