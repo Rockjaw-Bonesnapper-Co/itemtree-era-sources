@@ -14,7 +14,8 @@ All four come from the game client's own database tables for the build being com
     `ItemSparse` row. Only membership is read: a source row for an id not in here is dropped.
   * `undiscovered`: the ids this build LISTS but hides, an `Item` row with no `ItemSparse` row
     (the WoW Forever beta ships about 12,500 of them). Only membership is read, to count why
-    a row was dropped; no row is ever emitted for one.
+    a row was dropped. No row is emitted for one unless the caller passes it to `derive` in
+    `withheld`, the ids an earlier build named, whose rows then ship as a named item's do.
   * `locks`: the `Lock` table by id. Each value needs a `types` attribute: the
     `(LockType id, required skill)` pairs of the lock's slots whose Type is 2 (a LockType
     rather than a key item). Used to tell a herb node, a mining vein and a fishing pool from any

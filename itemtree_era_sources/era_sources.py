@@ -49,11 +49,18 @@ same way and for one question: which area a whole instance map IS, so that a cre
 inside one has a place at all. Neither database states an area for such a creature, and the
 answer is the build's own rather than a guess at an entrance.
 
-What is refused: every row for an id this build hides or does not ship; a quest only drop,
+What is refused: every row for an id this build does not ship, and for an id it hides unless the
+caller names it as withheld (below); a quest only drop,
 which the source marks with a negative chance; a chance that is zero, negative, above 100 or
 rounds below 0.1; a reference loot loop; a creature or object whose name is scaffolding
 rather than content; a container whose own item id this build will not name; and a quest row
 our own curated quest table already states first hand.
+
+Withheld ids, since 2026-09-26. `derive` takes an optional `withheld` set: ids this build hides
+(an `Item` row and no `ItemSparse` row) that an earlier build named, which the caller ships
+beside this table with their earlier details. Their rows are emitted exactly as a named item's
+are. The addon hides them until the player's own client can name the item or a setting says to
+show them. A hidden id NOT in the set, one no build has ever named, is still refused.
 
 See docs/era-sources.md, which is the record shape's contract and is what the addon half is
 briefed from. The whole feature is this module, its `compile` stage, the switch that turns it
@@ -68,7 +75,7 @@ import re
 import shutil
 import sqlite3
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -2404,8 +2411,15 @@ def _creature_pins(
     return {index: tuple(sorted(made, key=lambda pin: pin.order())) for index, made in sorted(pins.items())}
 
 
-def derive(era_input: EraInput, graph: BuildFacts) -> EraSources:
-    """Turn the two pinned databases into the table the addon ships, counting every refusal."""
+def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] = ()) -> EraSources:
+    """Turn the two pinned databases into the table the addon ships, counting every refusal.
+
+    `withheld` names the hidden ids whose rows ship anyway: ids this build lists and will not
+    name, which an earlier build did name. Their rows are emitted exactly as a named item's
+    are, and `counts["withheldItems"]` and `counts["withheldRows"]` say how many. Every other
+    hidden id is refused and counted under `dropped["hidden"]`, as before.
+    """
+    withheld_ids = frozenset(withheld)
     dropped: dict[str, int] = {
         "hidden": 0,
         "notShipped": 0,
@@ -2445,7 +2459,7 @@ def derive(era_input: EraInput, graph: BuildFacts) -> EraSources:
 
     # Every item either database says anything about, counted once per item.
     for item in sorted(set(candidates) | set(quests_for)):
-        if item not in graph.items:
+        if item not in graph.items and item not in withheld_ids:
             dropped["hidden" if item in graph.undiscovered else "notShipped"] += 1
             candidates.pop(item, None)
             quests_for.pop(item, None)
@@ -2555,6 +2569,9 @@ def derive(era_input: EraInput, graph: BuildFacts) -> EraSources:
     )
     counts["instanceAreas"] = len(instance_ids & set(areas_out))
     counts["rowsNamed"] = sum(1 for row in all_rows if "n" in row)
+    # The hidden ids the caller named as withheld, whose rows ship all the same. See derive.
+    counts["withheldItems"] = sum(1 for item in entries if item in withheld_ids)
+    counts["withheldRows"] = sum(len(rows) for item, rows in entries.items() if item in withheld_ids)
     counts["rowsWithFurtherQuests"] = sum(1 for row in all_rows if "m" in row)
     counts["rowsQuestOnly"] = sum(1 for row in all_rows if "o" in row)
     counts["questOnlyWithQuest"] = sum(1 for row in all_rows if "o" in row and "q" in row)
@@ -2678,9 +2695,11 @@ def header_lines(table: EraSources) -> list[str]:
         CREDIT,
         *licence_lines(),
         "No item names, tooltips, flavour text, icons, comments or quest text are taken from "
-        "either source, and no row is emitted for an item this build hides. The pins in mp are "
-        "the one coordinate this module takes, and they are reduced: no spawn table, no "
-        "respawn timer, no height, and no pfQuest coordinate at all.",
+        "either source. No row is emitted for an item this build hides, except the "
+        f"{counts.get('withheldItems', 0)} withheld items an earlier build named, whose "
+        f"{counts.get('withheldRows', 0)} rows ship so they can show once the client names the "
+        "item. The pins in mp are the one coordinate this module takes, and they are "
+        "reduced: no spawn table, no respawn timer, no height, and no pfQuest coordinate at all.",
         f"{counts.get('items', 0)} items, {counts.get('rows', 0)} rows ({', '.join(emitted)}), "
         f"{counts.get('rowsWithChance', 0)} with a chance, {counts.get('rowsWithArea', 0)} with "
         f"an area, over {counts.get('strings', 0)} strings and {counts.get('areas', 0)} areas.",
