@@ -80,7 +80,9 @@ from .paths import pipeline_version
 # ----- the pinned inputs ------------------------------------------------------------------
 
 CACHE_SUBDIR = "era"
-USER_AGENT = f"ItemTree-Data/{pipeline_version()} (+https://github.com/Rockjaw-Bonesnapper-Co/itemtree-era-sources)"
+USER_AGENT = (
+    f"ItemTree-Data/{pipeline_version()} (+https://github.com/Rockjaw-Bonesnapper-Co/itemtree-era-sources)"
+)
 
 CMANGOS_COMMIT = "22b51464f1625f6ef6275771de1f5466c6f5d19e"
 PFQUEST_COMMIT = "104f35678ca39ab1fb78b655f815cc7016f5e0c8"
