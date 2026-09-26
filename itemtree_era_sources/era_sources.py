@@ -680,6 +680,15 @@ class EraInput:
     vendor_offers: list[VendorOffer] = field(default_factory=list)
     vendor_template_offers: list[VendorOffer] = field(default_factory=list)
     quests: dict[int, QuestFacts] = field(default_factory=dict)
+    # Every quest_template entry, whatever it hands over or asks for, title or none. The
+    # compile ships these ids beside Era's QuestV2 ids as the quests Classic Era knew, so a
+    # quest on screen whose id is in neither reads as new in Forever.
+    quest_ids: set[int] = field(default_factory=set)
+    # quest id -> (the fixed reward item ids, the reward choice item ids), each in the
+    # template's slot order with repeats dropped, for every quest_template entry that hands
+    # over at least one item. Ids only: no counts and no text. The compile ships it as the
+    # QuestRewards module.
+    quest_rewards: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = field(default_factory=dict)
     areas: dict[int, str] = field(default_factory=dict)
     # Every CreatureDisplayInfo id THIS build carries. Nothing out of that table is shipped:
     # it is read so that a display id the client does not have is refused rather than handed
@@ -1115,15 +1124,21 @@ def _absorb(
     if table == "quest_template":
         qid = _int(col("entry"))
         title = (col("Title") or "").strip()
-        items: list[int] = []
+        if qid > 0:
+            era.quest_ids.add(qid)
+        fixed: list[int] = []
         for key in ("RewItemId1", "RewItemId2", "RewItemId3", "RewItemId4"):
             value = _int(col(key))
             if value > 0:
-                items.append(value)
+                fixed.append(value)
+        choices: list[int] = []
         for number in range(1, 7):
             value = _int(col(f"RewChoiceItemId{number}"))
             if value > 0:
-                items.append(value)
+                choices.append(value)
+        items: list[int] = fixed + choices
+        if qid > 0 and items:
+            era.quest_rewards[qid] = (tuple(dict.fromkeys(fixed)), tuple(dict.fromkeys(choices)))
         requires: list[int] = []
         for key in ("ReqItemId1", "ReqItemId2", "ReqItemId3", "ReqItemId4"):
             value = _int(col(key))
