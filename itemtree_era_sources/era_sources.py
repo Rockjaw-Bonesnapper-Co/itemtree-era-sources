@@ -20,7 +20,8 @@ What is taken, and nothing else: the source category, the creature, object, vend
 NAME, the creature and object **id**, the creature's display id, the Blizzard area id, the
 quest id and the faction its race mask implies, the drop chance, the level band of a
 summarised group, a limited stock vendor's stock count, the container item's own id, and since
-2026-09-20 a handful of **map pins** per creature name per area. No prose of any kind: not the
+2026-09-20 a handful of **map pins** per creature name per area, and since 2026-09-27 per herb,
+vein, fishing pool and chest name per area too. No prose of any kind: not the
 loot rows' `comments`, not quest text, not `SubName`, not gossip, not scripts.
 
 The pins are the one reversal of an old rule, and they are narrow. Until 2026-09-20 this module
@@ -29,14 +30,17 @@ points on a grid of five percent of that zone's map, quantised to a tenth of a p
 the creature page can draw a map: about eleven thousand numbers standing for seventy thousand
 spawns. No respawn timer, no height, no orientation, no guid and no per spawn anything reaches
 the file. The positions come from the cmangos dump, which is the GPL-3.0 source this one
-generated file already carries the licence of.
+generated file already carries the licence of. Since 2026-09-27 the same reduction is made of
+each herb's, vein's, fishing pool's and chest's `gameobject` spawns and shipped in `op`, so a
+node's page can draw a map the way a creature's does.
 
 Two inputs are pinned, fetched into the gitignored cache, verified by size and sha256 every
 run, and never committed:
 
   * the cmangos dump, for every fact above but the zones, the spawn positions among them;
   * two files of pfQuest's vanilla database, read for the **area id** a creature or an object
-    spawns in. The cmangos spawn tables carry a map and a coordinate and no area at all, and
+    spawns in (the objects file, like the units file, per spawn since 2026-09-27). The cmangos
+    spawn tables carry a map and a coordinate and no area at all, and
     turning a coordinate into an area needs terrain data this pipeline does not extract. Its
     own coordinates, which are already a zone percentage, are read for two things and no more:
     to tell which spawn of a creature a cmangos row is, so that spawn's area id can be taken,
@@ -717,10 +721,19 @@ class EraInput:
     # instance and takes this as its area, because no open world area is true of it.
     instance_areas: dict[int, int] = field(default_factory=dict)
     # object id -> every map the cmangos `gameobject` table spawns it on (a guid that leaves `id`
-    # at 0 counts for each entry `gameobject_spawn_entry` names). The map and nothing else: no
-    # position of an object is read. It exists for one question, whether a herb or a vein
+    # at 0 counts for each entry `gameobject_spawn_entry` names). The map alone: the positions
+    # are the object pins' input below, not this one's. It exists for one question, whether a herb or a vein
     # pfQuest states no zone for stands inside an instance (see instance_object_zones).
     object_spawn_maps: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    # The object map pins' three inputs (brief D7), the twins of `spawns`, `spawn_entries` and
+    # `unit_points`. `object_spawns` is the cmangos `gameobject` table, kept only for a chest or a
+    # fishing hole with a loot template (see lootable_object_spawns), each a Spawn whose
+    # `creature` field holds the object id; `object_spawn_entries` is `gameobject_spawn_entry`
+    # for the guids among them that leave `id` at 0; `object_points` is pfQuest per object spawn,
+    # for the area id and for the cross check.
+    object_spawns: tuple[Spawn, ...] = ()
+    object_spawn_entries: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    object_points: dict[int, tuple[SpawnPoint, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -744,6 +757,12 @@ class EraSources:
     lists: list[str] = field(default_factory=list)
     # A creature name's index into `s` -> its map pins, packed by pack_pin.
     pins: dict[int, str] = field(default_factory=dict)
+    # An OBJECT name's index into `s` -> its map pins, packed by pack_pin (brief D7). Its own
+    # table rather than `mp`, because one string can name a creature and an object both.
+    object_pins: dict[int, str] = field(default_factory=dict)
+    # An object name's index into `s` -> the category its rows are filed under (8 herb, 9 vein,
+    # 10 fishing pool, 11 chest), for every name `op` carries.
+    object_kinds: dict[int, int] = field(default_factory=dict)
     # areaId -> the zone level UiMap id THIS build draws that area on, for every area `z` names
     # that resolves to one. An area with no entry has no map on this build.
     area_maps: dict[int, int] = field(default_factory=dict)
@@ -759,6 +778,8 @@ class EraSources:
             "ck": dict(self.kinds),
             "cd": dict(self.displays),
             "mp": dict(self.pins),
+            "op": dict(self.object_pins),
+            "ok": dict(self.object_kinds),
             "zm": dict(self.area_maps),
             "x": dict(self.list_index),
             "xl": list(self.lists),
@@ -972,9 +993,9 @@ class _Reading:
     spawn_entries: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
     events: dict[int, int] = field(default_factory=dict)
     pools: set[int] = field(default_factory=set)
-    # guid -> (object id, map), the `gameobject` table with everything else dropped, and the
-    # entries `gameobject_spawn_entry` names for a guid that leaves its id at 0.
-    object_rows: list[tuple[int, int, int]] = field(default_factory=list)
+    # guid -> (object id, map, x, y), the `gameobject` table with everything else dropped, and
+    # the entries `gameobject_spawn_entry` names for a guid that leaves its id at 0.
+    object_rows: list[tuple[int, int, int, float, float]] = field(default_factory=list)
     object_entries: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
 
 
@@ -1045,20 +1066,55 @@ def read_cmangos(path: Path) -> EraInput:
         guid: tuple(sorted(set(entries))) for guid, entries in sorted(reading.spawn_entries.items())
     }
     era.object_spawn_maps = object_maps(reading.object_rows, reading.object_entries)
+    era.object_spawns, era.object_spawn_entries = lootable_object_spawns(
+        reading.object_rows, reading.object_entries, era.objects
+    )
     return era
 
 
-def object_maps(
-    rows: Sequence[tuple[int, int, int]], entries: Mapping[int, Sequence[int]]
-) -> dict[int, tuple[int, ...]]:
+def object_maps(rows: Sequence[tuple], entries: Mapping[int, Sequence[int]]) -> dict[int, tuple[int, ...]]:
     """object id -> the maps it spawns on, ascending. A guid with no id of its own stands for
-    every entry `gameobject_spawn_entry` names for it."""
+    every entry `gameobject_spawn_entry` names for it. Each row is (guid, id, map, ...): the
+    position the reader keeps behind the map is not read here."""
     maps: dict[int, set[int]] = defaultdict(set)
-    for guid, oid, map_id in rows:
+    for guid, oid, map_id, *_rest in rows:
         for member in (oid,) if oid else entries.get(guid, ()):
             if member:
                 maps[member].add(map_id)
     return {oid: tuple(sorted(found)) for oid, found in sorted(maps.items())}
+
+
+def _lootable(obj: ObjectFacts | None) -> bool:
+    """A chest or a fishing hole with a loot template: the only objects a source row can name."""
+    return obj is not None and obj.kind in (GO_TYPE_CHEST, GO_TYPE_FISHING_HOLE) and bool(obj.loot)
+
+
+def lootable_object_spawns(
+    rows: Sequence[tuple[int, int, int, float, float]],
+    entries: Mapping[int, Sequence[int]],
+    objects: Mapping[int, ObjectFacts],
+) -> tuple[tuple[Spawn, ...], dict[int, tuple[int, ...]]]:
+    """The `gameobject` rows an object pin could ever be made from, as spawns, and the spawn
+    entries of the guids among them that leave their id at 0.
+
+    Only a chest or a fishing hole with a loot template can be the object a source row names, so
+    every other object's spawn (a door, a chair, a mailbox, a quest object) is dropped here, at
+    the end of the streaming pass, and never reaches an EraInput. A Spawn's `creature` field
+    holds the OBJECT id: the shape is the creature table's, and so is every rule read over it.
+    """
+    kept_entries: dict[int, tuple[int, ...]] = {}
+    spawns: list[Spawn] = []
+    for guid, oid, map_id, x, y in sorted(rows):
+        if oid:
+            if not _lootable(objects.get(oid)):
+                continue
+        else:
+            members = tuple(sorted({e for e in entries.get(guid, ()) if _lootable(objects.get(e))}))
+            if not members:
+                continue
+            kept_entries[guid] = members
+        spawns.append(Spawn(guid=guid, creature=oid, map=map_id, x=x, y=y))
+    return tuple(spawns), kept_entries
 
 
 def _absorb(
@@ -1143,8 +1199,18 @@ def _absorb(
         reading.spawn_entries[_int(col("guid"))].append(_int(col("entry")))
         return
     if table == "gameobject":
-        # The map alone: an object has no map pins, so no position of one is ever read.
-        reading.object_rows.append((_int(col("guid")), _int(col("id")), _int(col("map"))))
+        # The map and the position, and nothing else: not the z, not the orientation, not the
+        # rotation, not the spawn mask and not the respawn times. Since 2026-09-27 (brief D7) the
+        # position is read for the object map pins, the way the `creature` table's always was.
+        reading.object_rows.append(
+            (
+                _int(col("guid")),
+                _int(col("id")),
+                _int(col("map")),
+                _num(col("position_x")),
+                _num(col("position_y")),
+            )
+        )
         return
     if table == "gameobject_spawn_entry":
         reading.object_entries[_int(col("guid"))].append(_int(col("entry")))
@@ -1252,8 +1318,9 @@ def zones_from_points(points: Mapping[int, Sequence[SpawnPoint]]) -> dict[int, t
 
 
 def read_zone_map(path: Path) -> dict[int, tuple[int, ...]]:
-    """id -> the area ids that id spawns in, commonest first. The objects file is read for this
-    and nothing else: an object has no map pins, so its spawn positions are never read."""
+    """id -> the area ids that id spawns in, commonest first, and nothing else. The stage itself
+    reads the objects file through read_spawn_points since brief D7, because the object map pins
+    match each spawn to its area the way the creature pins do; this is the zones alone."""
     return zones_from_points(read_spawn_points(path))
 
 
@@ -1681,13 +1748,19 @@ class _Strings:
 
     def __init__(self) -> None:
         self._index: dict[str, int] = {}
+        self._values: list[str] = []
 
     def add(self, value: str) -> int:
         found = self._index.get(value)
         if found is None:
             found = len(self._index) + 1
             self._index[value] = found
+            self._values.append(value)
         return found
+
+    def value(self, index: int) -> str:
+        """The string at one insertion index, or "" for an index this table never handed out."""
+        return self._values[index - 1] if 0 < index <= len(self._values) else ""
 
     def sorted_table(self) -> tuple[list[str], dict[int, int]]:
         """The strings in sorted order, and a remap from the insertion index to the new one.
@@ -2453,6 +2526,104 @@ def _pin_area(
     return best
 
 
+@dataclass
+class _Placed:
+    """What placing one set of spawns on their zone maps found, before any reduction."""
+
+    # (name, area) -> every placed position, as a zone map percentage.
+    groups: dict[tuple[str, int], list[tuple[float, float]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    checked: int = 0
+    agreed: int = 0
+    instance: int = 0
+    outside: int = 0
+    no_area: int = 0
+
+
+def _place_spawns(
+    era_input: EraInput,
+    by_name: Mapping[str, Sequence[int]],
+    by_id: Mapping[int, Sequence[Spawn]],
+    zones: Mapping[int, tuple[int, ...]],
+    stated: Mapping[int, Sequence[SpawnPoint]],
+) -> _Placed:
+    """Every spawn of every id each name stands for, placed on the zone map of its own area.
+
+    The one placing pass, shared by the creature pins and the object pins: `zones` and `stated`
+    are pfQuest's areas and points for the same ids (units for a creature, objects for an
+    object), and the rules are the same for both. A spawn whose id pfQuest knows no area for is
+    counted in `no_area` and dropped, one on a map no candidate zone has an assignment for (every
+    instance) in `instance`, and one whose position falls outside every candidate's map in
+    `outside`.
+    """
+    placed = _Placed()
+    for name in sorted(by_name):
+        for key in by_name[name]:
+            spawns = by_id.get(key, ())
+            if not spawns:
+                continue
+            points: dict[int, list[SpawnPoint]] = defaultdict(list)
+            for point in stated.get(key, ()):
+                points[point.area].append(point)
+            candidates = [
+                area for area in zones.get(key, ()) if area in era_input.areas and area in era_input.area_maps
+            ]
+            if not candidates:
+                placed.no_area += len(spawns)
+                continue
+            maps = {area: era_input.area_maps[area] for area in candidates}
+            for spawn in spawns:
+                found = _pin_area(spawn, candidates, maps, era_input.map_bounds, points)
+                if found is None:
+                    if any(era_input.map_bounds.get((maps[area], spawn.map)) for area in candidates):
+                        placed.outside += 1
+                    else:
+                        placed.instance += 1
+                    continue
+                area, x, y = found
+                placed.groups[(name, area)].append((x, y))
+                # The cross check, on the real run: how close the formula's own answer sits to
+                # the nearest pfQuest spawn of the same id in the same area. pfQuest is a
+                # reduction of a different world database, so the two do not have the same spawn
+                # set and a disagreement is news about a build, not a failure.
+                here = points.get(area)
+                if here:
+                    placed.checked += 1
+                    gap = min(max(abs(point.x - x), abs(point.y - y)) for point in here)
+                    if gap <= PIN_AGREEMENT:
+                        placed.agreed += 1
+    return placed
+
+
+def _reduce_placed(
+    placed: _Placed,
+    era_input: EraInput,
+    strings: _Strings,
+    used_areas: dict[int, int],
+) -> tuple[dict[int, tuple[MapPin, ...]], int, list[float]]:
+    """Each (name, area) group reduced to its pins, keyed by the name's index into `s`, with the
+    number of spawns the kept groups stand for and each group's coverage share."""
+    pins: dict[int, list[MapPin]] = defaultdict(list)
+    total = 0
+    shares: list[float] = []
+    for (name, area), points_in_area in sorted(placed.groups.items()):
+        made = reduce_pins(area, points_in_area)
+        if not made:
+            continue
+        # How much of the group the kept cells account for. Per group, the way the measurement
+        # that chose the cap and the cell size was made: a handful of huge groups would
+        # otherwise drown out the three thousand ordinary ones.
+        shares.append(sum(pin.weight for pin in made) / len(points_in_area))
+        total += len(points_in_area)
+        pins[strings.add(name)].extend(made)
+        used_areas[area] = strings.add(era_input.areas[area])
+    ordered = {
+        index: tuple(sorted(made, key=lambda pin: pin.order())) for index, made in sorted(pins.items())
+    }
+    return ordered, total, shares
+
+
 def _creature_pins(
     era_input: EraInput,
     names: set[str],
@@ -2482,78 +2653,106 @@ def _creature_pins(
         if facts.name in names:
             by_name[facts.name].append(creature)
 
-    placed: dict[tuple[str, int], list[tuple[float, float]]] = defaultdict(list)
-    checked = 0
-    agreed = 0
-    instance = 0
-    outside = 0
-    no_area = 0
-    for name in sorted(by_name):
-        for creature in by_name[name]:
-            spawns = by_creature.get(creature, ())
-            if not spawns:
-                continue
-            points: dict[int, list[SpawnPoint]] = defaultdict(list)
-            for point in era_input.unit_points.get(creature, ()):
-                points[point.area].append(point)
-            candidates = [
-                area
-                for area in era_input.unit_zones.get(creature, ())
-                if area in era_input.areas and area in era_input.area_maps
-            ]
-            if not candidates:
-                no_area += len(spawns)
-                continue
-            maps = {area: era_input.area_maps[area] for area in candidates}
-            for spawn in spawns:
-                found = _pin_area(spawn, candidates, maps, era_input.map_bounds, points)
-                if found is None:
-                    if any(era_input.map_bounds.get((maps[area], spawn.map)) for area in candidates):
-                        outside += 1
-                    else:
-                        instance += 1
-                    continue
-                area, x, y = found
-                placed[(name, area)].append((x, y))
-                # The cross check, on the real run: how close the formula's own answer sits to
-                # the nearest pfQuest spawn of the same creature in the same area. pfQuest is a
-                # reduction of a different world database, so the two do not have the same spawn
-                # set and a disagreement is news about a build, not a failure.
-                here = points.get(area)
-                if here:
-                    checked += 1
-                    gap = min(max(abs(point.x - x), abs(point.y - y)) for point in here)
-                    if gap <= PIN_AGREEMENT:
-                        agreed += 1
+    placed = _place_spawns(era_input, by_name, by_creature, era_input.unit_zones, era_input.unit_points)
+    pins, total, shares = _reduce_placed(placed, era_input, strings, used_areas)
 
-    pins: dict[int, list[MapPin]] = defaultdict(list)
-    total = 0
-    shares: list[float] = []
-    for (name, area), points_in_area in sorted(placed.items()):
-        made = reduce_pins(area, points_in_area)
-        if not made:
-            continue
-        # How much of the group the kept cells account for. Per group, the way the measurement
-        # that chose the cap and the cell size was made: a handful of huge groups would
-        # otherwise drown out the three thousand ordinary ones.
-        shares.append(sum(pin.weight for pin in made) / len(points_in_area))
-        total += len(points_in_area)
-        pins[strings.add(name)].extend(made)
-        used_areas[area] = strings.add(era_input.areas[area])
-
-    dropped["pinInsideInstance"] = instance
-    dropped["pinOutsideMap"] = outside
-    dropped["pinNoAreaKnown"] = no_area
+    dropped["pinInsideInstance"] = placed.instance
+    dropped["pinOutsideMap"] = placed.outside
+    dropped["pinNoAreaKnown"] = placed.no_area
     counts["pins"] = sum(len(made) for made in pins.values())
     counts["pinNames"] = len(pins)
-    counts["pinGroups"] = len(placed)
+    counts["pinGroups"] = len(placed.groups)
     counts["pinSpawnsPlaced"] = total
     counts["pinCoverageMeanPercent"] = int(round(100.0 * sum(shares) / len(shares))) if shares else 0
     counts["pinCoverageWorstPercent"] = int(round(100.0 * min(shares))) if shares else 0
-    counts["pinSpawnsChecked"] = checked
-    counts["pinSpawnsAgreed"] = agreed
-    counts["pinAgreementPercent"] = int(round(100.0 * agreed / checked)) if checked else 0
-    return {index: tuple(sorted(made, key=lambda pin: pin.order())) for index, made in sorted(pins.items())}
+    counts["pinSpawnsChecked"] = placed.checked
+    counts["pinSpawnsAgreed"] = placed.agreed
+    counts["pinAgreementPercent"] = (
+        int(round(100.0 * placed.agreed / placed.checked)) if placed.checked else 0
+    )
+    return pins
+
+
+# The categories whose `n` is an OBJECT, which are the ones an object pin is made for, and the
+# word each is counted under.
+OBJECT_CATEGORIES = {CAT_HERB: "Herb", CAT_VEIN: "Vein", CAT_FISHED: "Pool", CAT_OBJECT: "Chest"}
+
+
+def _object_pins(
+    era_input: EraInput,
+    names: Mapping[str, int],
+    strings: _Strings,
+    used_areas: dict[int, int],
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> dict[int, tuple[MapPin, ...]]:
+    """An OBJECT name's index into `s` -> its map pins (brief D7), by exactly the creature rule.
+
+    `names` is every object name a shipped row or list names, with the category it is filed
+    under. Each name stands for every chest or fishing hole of that name with a loot template,
+    which is what `object_spawns` holds; the area of each spawn is pfQuest's objects file, read
+    the way its units file is for a creature, and a spawn of an object pfQuest places nowhere is
+    dropped and counted under `objectPinNoAreaKnown`. Keyed by the name, like `mp`, and shipped
+    in `op` beside it: see derive for why the two are not one table.
+    """
+    by_object, _event_only, nameless = _spawns_by_creature(
+        era_input.object_spawns, era_input.object_spawn_entries
+    )
+    counts["objectPinSpawnsWithoutObject"] = nameless
+
+    by_name: dict[str, list[int]] = defaultdict(list)
+    for oid in sorted(era_input.objects):
+        obj = era_input.objects[oid]
+        if obj.name in names and _lootable(obj) and not is_scaffolding(obj.name):
+            by_name[obj.name].append(oid)
+
+    placed = _place_spawns(era_input, by_name, by_object, era_input.object_zones, era_input.object_points)
+    pins, total, _shares = _reduce_placed(placed, era_input, strings, used_areas)
+
+    dropped["objectPinInsideInstance"] = placed.instance
+    dropped["objectPinOutsideMap"] = placed.outside
+    dropped["objectPinNoAreaKnown"] = placed.no_area
+    counts["objectPins"] = sum(len(made) for made in pins.values())
+    counts["objectPinNames"] = len(pins)
+    counts["objectPinGroups"] = len(placed.groups)
+    counts["objectPinSpawnsPlaced"] = total
+    counts["objectPinSpawnsChecked"] = placed.checked
+    counts["objectPinSpawnsAgreed"] = placed.agreed
+    for category, word in OBJECT_CATEGORIES.items():
+        kept = [index for index in pins if names.get(strings.value(index), 0) == category]
+        counts[f"objectPinNames{word}"] = len(kept)
+        counts[f"objectPins{word}"] = sum(len(pins[index]) for index in kept)
+    return pins
+
+
+def _object_names(
+    entries: Mapping[int, Sequence[dict]],
+    leftovers: Mapping[int, Mapping[int, Sequence[dict]]],
+    strings: _Strings,
+) -> dict[str, int]:
+    """Every object name a shipped row or a packed list names -> the category it is filed under.
+
+    The rows still carry insertion indexes here, before the string table is sorted. A name filed
+    under two object categories (a node that is also a chest somewhere) takes the lower number,
+    so the answer never depends on the order the items were read in.
+    """
+    found: dict[str, int] = {}
+
+    def note(row: Mapping) -> None:
+        category = row.get("c")
+        if category in OBJECT_CATEGORIES and "n" in row and "t" not in row:
+            name = strings.value(row["n"])
+            if name:
+                found[name] = min(found.get(name, category), category)
+
+    for rows in entries.values():
+        for row in rows:
+            note(row)
+    for by_kind_rows in leftovers.values():
+        for rest in by_kind_rows.values():
+            for row in rest:
+                note(row)
+    return dict(sorted(found.items()))
 
 
 def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] = ()) -> EraSources:
@@ -2577,6 +2776,9 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         "pinInsideInstance": 0,
         "pinOutsideMap": 0,
         "pinNoAreaKnown": 0,
+        "objectPinInsideInstance": 0,
+        "objectPinOutsideMap": 0,
+        "objectPinNoAreaKnown": 0,
     }
     counts: dict[str, int] = {
         "multiQuest": 0,
@@ -2650,6 +2852,14 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # The pins go last of the four, because a pin's own area is an area the player can now read
     # and so has to reach `z` and `s` before the string table is sorted.
     pins = _creature_pins(era_input, creature_names, strings, used_areas, counts, dropped)
+    # The object pins (brief D7), for every object name a shipped row or list names. Shipped in
+    # `op` rather than in `mp`: `s` is one string table, and a name can be a creature's and an
+    # object's both, so one table keyed by name could not say whose pins it holds.
+    object_names = _object_names(entries, leftovers, strings)
+    object_pins = _object_pins(era_input, object_names, strings, used_areas, counts, dropped)
+    counts["objectPinNamesSharedWithCreature"] = sum(
+        1 for index in object_pins if strings.value(index) in creature_names
+    )
 
     table, remap = strings.sorted_table()
     for rows in entries.values():
@@ -2671,6 +2881,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         remap[index]: "".join(pack_pin(pin.area, pin.x, pin.y) for pin in made)
         for index, made in pins.items()
     }
+    object_pins_out = {
+        remap[index]: "".join(pack_pin(pin.area, pin.x, pin.y) for pin in made)
+        for index, made in object_pins.items()
+    }
+    object_kinds_out = {remap[index]: object_names[strings.value(index)] for index in object_pins}
     # The map to draw, for every area a pin or a row uses. An area this build resolves to no
     # zone map gets no entry and no pin: the eight instance root areas are the whole of that on
     # 1.60.1.69913, and the addon says the creature is inside the instance instead.
@@ -2740,6 +2955,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         kinds=dict(sorted(kinds.items())),
         displays=dict(sorted(displays.items())),
         pins=dict(sorted(pins_out.items())),
+        object_pins=dict(sorted(object_pins_out.items())),
+        object_kinds=dict(sorted(object_kinds_out.items())),
         area_maps=area_maps_out,
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
@@ -2766,7 +2983,8 @@ def header_lines(table: EraSources) -> list[str]:
         "{ s = {strings}, z = { [areaId] = string index }, r = { [itemId] = { row, row, ... } }, "
         "qt = { [questId] = string index }, ck = { [string index] = packed creature kind }, "
         "cd = { [string index] = creature display id }, "
-        "mp = { [string index] = packed map pins }, zm = { [areaId] = uiMapId }, "
+        "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
+        "ok = { [string index] = object category }, zm = { [areaId] = uiMapId }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... } }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
@@ -2830,6 +3048,15 @@ def header_lines(table: EraSources) -> list[str]:
         f"{PIN_CELL:.0f} percent cell of that map, so the pins are a picture of where the "
         "creature is found and not a copy of a spawn table. No spawn count, no respawn timer, "
         "no height. A name with no entry has no pins, which is not an error.",
+        "op: where an OBJECT name is found (c=8, 9, 10, 11: a herb, a vein, a fishing pool, a "
+        "chest), as map pins in exactly mp's packing and by exactly mp's rule, over the cmangos "
+        "gameobject spawns of every chest or fishing hole of that name with loot, each spawn's "
+        "area taken from pfQuest's objects file. Its own table and not mp, because s is one "
+        "string table and one name can be a creature's and an object's both.",
+        "ok: the category an op name's rows are filed under (8 herb, 9 vein, 10 fishing pool, "
+        "11 chest; the lower where a name is filed under two), for every name op carries and "
+        "no other, so the addon can say what a node is and whether it has a map without "
+        "decoding a pin.",
         "zm: the zone level UiMap id THIS build draws an area on, for every area z names that "
         "resolves to one. Absent means this build has no map for that area, which is every "
         "instance root area: this build ships no dungeon map at all, so a creature inside one "
@@ -2848,7 +3075,7 @@ def header_lines(table: EraSources) -> list[str]:
         "either source. No row is emitted for an item this build hides, except the "
         f"{counts.get('withheldItems', 0)} withheld items an earlier build named, whose "
         f"{counts.get('withheldRows', 0)} rows ship so they can show once the client names the "
-        "item. The pins in mp are the one coordinate this module takes, and they are "
+        "item. The pins in mp and op are the one coordinate this module takes, and they are "
         "reduced: no spawn table, no respawn timer, no height, and no pfQuest coordinate at all.",
         f"{counts.get('items', 0)} items, {counts.get('rows', 0)} rows ({', '.join(emitted)}), "
         f"{counts.get('rowsWithChance', 0)} with a chance, {counts.get('rowsWithArea', 0)} with "
@@ -2860,7 +3087,12 @@ def header_lines(table: EraSources) -> list[str]:
         "distinct packed strings.",
         f"{counts.get('pins', 0)} map pins in mp over {counts.get('pinNames', 0)} names and "
         f"{counts.get('pinGroups', 0)} name and area groups, standing for "
-        f"{counts.get('pinSpawnsPlaced', 0)} spawns, and {counts.get('areaMaps', 0)} area to "
+        f"{counts.get('pinSpawnsPlaced', 0)} spawns; {counts.get('objectPins', 0)} object map pins "
+        f"in op over {counts.get('objectPinNames', 0)} names (herbs "
+        f"{counts.get('objectPinsHerb', 0)}, veins {counts.get('objectPinsVein', 0)}, fishing "
+        f"pools {counts.get('objectPinsPool', 0)}, chests {counts.get('objectPinsChest', 0)}), "
+        f"standing for {counts.get('objectPinSpawnsPlaced', 0)} spawns; and "
+        f"{counts.get('areaMaps', 0)} area to "
         f"UiMap answers in zm ({counts.get('areasWithNoMap', 0)} areas this build has no map "
         "for).",
         f"{counts.get('rowsInsideInstance', 0)} rows and "
@@ -2890,7 +3122,8 @@ def gather_input(
     era_input = read_cmangos(cmangos)
     era_input.unit_points = read_spawn_points(units)
     era_input.unit_zones = zones_from_points(era_input.unit_points)
-    era_input.object_zones = read_zone_map(objects)
+    era_input.object_points = read_spawn_points(objects)
+    era_input.object_zones = zones_from_points(era_input.object_points)
     era_input.areas = area_names(conn, build)
     era_input.display_ids = build_display_ids(conn, build)
     era_input.area_maps = area_maps(conn, build, era_input.areas)
