@@ -65,7 +65,13 @@ class Paths:
 
     @property
     def addon_generated(self) -> Path:
+        """The modules ItemTree loads at login (the core set)."""
         return self.addon_root / "Data" / "generated"
+
+    @property
+    def addon_data_generated(self) -> Path:
+        """The modules the load on demand addon ItemTree_Data holds, in its folder in the checkout."""
+        return self.addon_root / "ItemTree_Data" / "Data" / "generated"
 
     def build_dir(self, build: str) -> Path:
         return self.builds / build
