@@ -75,7 +75,7 @@ import re
 import shutil
 import sqlite3
 from collections import Counter, defaultdict
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -316,9 +316,13 @@ WORLD_DROP_CREATURES = 40
 # Spring Water has 184.
 VENDOR_SUMMARY_AT = 20
 
-# A herb or a vein is one node name in many zones, so it is listed by zone rather than by
-# node, up to this many zones per node.
+# A herb or a vein is one node name in many zones. It is listed NODE by node, each node's zone
+# rows together (up to this many zones per node, commonest first), and the named row cap counts
+# nodes rather than rows: see _node_rows.
 MAX_NODE_ZONES = 4
+
+# The two categories whose rows are a node's zones, grouped node by node.
+NODE_CATEGORIES = frozenset({CAT_HERB, CAT_VEIN})
 
 # How many further quests a quest row may carry behind the first, in `m`. Unchanged from the
 # first version: the case this exists to answer is the same turn in offered to each side.
@@ -712,6 +716,11 @@ class EraInput:
     # it names one for. A creature whose spawns are all on one such map lives inside that
     # instance and takes this as its area, because no open world area is true of it.
     instance_areas: dict[int, int] = field(default_factory=dict)
+    # object id -> every map the cmangos `gameobject` table spawns it on (a guid that leaves `id`
+    # at 0 counts for each entry `gameobject_spawn_entry` names). The map and nothing else: no
+    # position of an object is read. It exists for one question, whether a herb or a vein
+    # pfQuest states no zone for stands inside an instance (see instance_object_zones).
+    object_spawn_maps: dict[int, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -856,6 +865,8 @@ WANTED_TABLES = (
     "game_event_creature",
     "creature_template",
     "gameobject_template",
+    "gameobject",
+    "gameobject_spawn_entry",
     "creature_loot_template",
     "skinning_loot_template",
     "pickpocketing_loot_template",
@@ -961,6 +972,10 @@ class _Reading:
     spawn_entries: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
     events: dict[int, int] = field(default_factory=dict)
     pools: set[int] = field(default_factory=set)
+    # guid -> (object id, map), the `gameobject` table with everything else dropped, and the
+    # entries `gameobject_spawn_entry` names for a guid that leaves its id at 0.
+    object_rows: list[tuple[int, int, int]] = field(default_factory=list)
+    object_entries: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
 
 
 def read_cmangos(path: Path) -> EraInput:
@@ -1029,7 +1044,21 @@ def read_cmangos(path: Path) -> EraInput:
     era.spawn_entries = {
         guid: tuple(sorted(set(entries))) for guid, entries in sorted(reading.spawn_entries.items())
     }
+    era.object_spawn_maps = object_maps(reading.object_rows, reading.object_entries)
     return era
+
+
+def object_maps(
+    rows: Sequence[tuple[int, int, int]], entries: Mapping[int, Sequence[int]]
+) -> dict[int, tuple[int, ...]]:
+    """object id -> the maps it spawns on, ascending. A guid with no id of its own stands for
+    every entry `gameobject_spawn_entry` names for it."""
+    maps: dict[int, set[int]] = defaultdict(set)
+    for guid, oid, map_id in rows:
+        for member in (oid,) if oid else entries.get(guid, ()):
+            if member:
+                maps[member].add(map_id)
+    return {oid: tuple(sorted(found)) for oid, found in sorted(maps.items())}
 
 
 def _absorb(
@@ -1112,6 +1141,13 @@ def _absorb(
         return
     if table == "creature_spawn_entry":
         reading.spawn_entries[_int(col("guid"))].append(_int(col("entry")))
+        return
+    if table == "gameobject":
+        # The map alone: an object has no map pins, so no position of one is ever read.
+        reading.object_rows.append((_int(col("guid")), _int(col("id")), _int(col("map"))))
+        return
+    if table == "gameobject_spawn_entry":
+        reading.object_entries[_int(col("guid"))].append(_int(col("entry")))
         return
     if table == "game_event_creature":
         reading.events[_int(col("guid"))] = _int(col("event"))
@@ -1682,6 +1718,9 @@ class _Source:
     quest_only: bool = False
     # The quest that asks for it, where the source names one without guesswork.
     quest: int = 0
+    # A herb or a vein only: where this zone stands in the node's own zones, commonest first.
+    # It orders a node's zone rows (see _node_rows) and nothing else.
+    spot: int = 0
 
     def order(self) -> tuple:
         """Best first, and never by anything that varies between runs.
@@ -1756,6 +1795,26 @@ def instance_zones(era_input: EraInput) -> dict[int, int]:
     return out
 
 
+def instance_object_zones(era_input: EraInput) -> dict[int, int]:
+    """object id -> the area of the instance it stands inside, where that is its whole place.
+
+    The object twin of instance_zones, by the same rule: only where EVERY spawn the dump keeps
+    for that object is on ONE map and that map is an instance this build names an area for.
+    pfQuest states no zone for an object inside an instance, so without this a herb in Zul'Gurub
+    is a row with no place at all.
+    """
+    if not era_input.instance_areas:
+        return {}
+    out: dict[int, int] = {}
+    for oid, maps in sorted(era_input.object_spawn_maps.items()):
+        if len(maps) != 1:
+            continue
+        area = era_input.instance_areas.get(maps[0], 0)
+        if area:
+            out[oid] = area
+    return out
+
+
 def collect(era_input: EraInput, graph: BuildFacts, dropped: dict[str, int]) -> dict[int, list[_Source]]:
     """Every candidate source for every item, before any cap is applied."""
     areas = era_input.areas
@@ -1827,6 +1886,7 @@ def collect(era_input: EraInput, graph: BuildFacts, dropped: dict[str, int]) -> 
                     )
 
     # World objects. Only a chest and a fishing hole ever carry loot a player can take.
+    inside_objects = instance_object_zones(era_input)
     by_object_template: dict[int, list[int]] = defaultdict(list)
     for oid in sorted(objects):
         obj = objects[oid]
@@ -1840,14 +1900,18 @@ def collect(era_input: EraInput, graph: BuildFacts, dropped: dict[str, int]) -> 
                 continue
             category = _object_category(graph, obj)
             spawn_zones = [area for area in era_input.object_zones.get(oid, ()) if area in areas]
-            # A herb or a vein is one name in many places, so it is listed by zone. Everything
-            # else is listed once, in the zone it is commonest in.
-            if category in (CAT_HERB, CAT_VEIN) and spawn_zones:
+            # A herb or a vein is one name in many places, so it is listed by zone, commonest
+            # first; one pfQuest places nowhere takes the instance it stands inside, where the
+            # dump's own spawns say so. Everything else is listed once, in the zone it is
+            # commonest in.
+            if category in NODE_CATEGORIES and spawn_zones:
                 places = spawn_zones[:MAX_NODE_ZONES]
+            elif category in NODE_CATEGORIES and inside_objects.get(oid):
+                places = [inside_objects[oid]]
             else:
                 places = [spawn_zones[0]] if spawn_zones else [0]
             for item, drop in sorted(items.items()):
-                for area in places:
+                for spot, area in enumerate(places):
                     candidates[item].append(
                         _Source(
                             category=category,
@@ -1856,6 +1920,7 @@ def collect(era_input: EraInput, graph: BuildFacts, dropped: dict[str, int]) -> 
                             chance=drop.chance,
                             quest_only=drop.quest_only,
                             quest=asked_by(item) if drop.quest_only else 0,
+                            spot=spot,
                         )
                     )
 
@@ -1928,15 +1993,16 @@ def collect(era_input: EraInput, graph: BuildFacts, dropped: dict[str, int]) -> 
 # ----- the caps ---------------------------------------------------------------------------------
 
 
-def _summary(category: int, group: Sequence[_Source]) -> dict:
+def _summary(category: int, group: Sequence[_Source], total: int | None = None) -> dict:
     """The row that stands for a whole category: how many sources it has, and their level band.
 
     `t` is always the total for that category on that item, never the leftover. The addon
     subtracts the named rows it has already drawn, which is one rule for both the capped case
     (three named, t of 242, so "and 239 more") and the summarise in place case (no named rows
-    at all, so "184 vendors"). One meaning, decidable from the list itself.
+    at all, so "184 vendors"). One meaning, decidable from the list itself. For a herb or a vein
+    the sources are NODES, so `total` is the node count and the addon counts the nodes it drew.
     """
-    row: dict = {"c": category, "t": len(group)}
+    row: dict = {"c": category, "t": len(group) if total is None else total}
     levels = [source for source in group if source.min_level]
     if levels:
         row["lo"] = min(source.min_level for source in levels)
@@ -1967,6 +2033,67 @@ def _named_row(source: _Source, strings: _Strings, used_areas: dict[int, int], a
         if source.quest:
             row["q"] = source.quest
     return row
+
+
+def by_node(ranked: Sequence[_Source]) -> list[list[_Source]]:
+    """A herb's or a vein's sources, grouped into nodes, in the order to draw them.
+
+    A node is one name. The nodes go best first (a node anyone can gather before a quest only
+    one, then the node's best chance, then its name), and inside one node its zone rows go the
+    way the node's own zones do: anyone first, best chance first, then commonest first as the
+    spawn table states them, then area id. Nothing here varies between runs.
+
+    A row with no area inside a node that has zones says nothing its zone rows do not (one of
+    the node's objects pfQuest places nowhere, Copper Vein's on Copper Ore), so it is dropped.
+    """
+    nodes: dict[str, list[_Source]] = {}
+    for source in ranked:
+        nodes.setdefault(source.name, []).append(source)
+    for name, group in nodes.items():
+        placed = [source for source in group if source.area]
+        if placed:
+            nodes[name] = placed
+    groups = [
+        sorted(group, key=lambda source: (source.quest_only, -source.chance, source.spot, source.area))
+        for group in nodes.values()
+    ]
+    groups.sort(
+        key=lambda group: (
+            all(source.quest_only for source in group),
+            -max(source.chance for source in group),
+            group[0].name,
+        )
+    )
+    return groups
+
+
+def _node_rows(
+    category: int,
+    ranked: Sequence[_Source],
+    listed: Callable[[Sequence[_Source]], list[dict]],
+    strings: _Strings,
+    used_areas: dict[int, int],
+    areas: Mapping[int, str],
+    counts: dict[str, int],
+) -> tuple[list[dict], list[dict]]:
+    """Rule 1 for a herb or a vein, counted in NODES rather than rows.
+
+    The first MAX_NAMED_ROWS nodes are named, each with all its zone rows together; the summary
+    row's `t` is the node count; and the list behind it holds the remaining nodes' zone rows in
+    the same node major order. The leftover of one exception is the same, by node: four nodes
+    are four named nodes and no summary.
+    """
+    nodes = by_node(ranked)
+    named = MAX_NAMED_ROWS
+    if len(nodes) == MAX_NAMED_ROWS + 1:
+        named = len(nodes)
+        counts["summaryOfOne"] += 1
+    rows = [_named_row(source, strings, used_areas, areas) for node in nodes[:named] for source in node]
+    if len(nodes) > named:
+        counts["summaryRows"] += 1
+        rows.append(_summary(category, ranked, total=len(nodes)))
+        return rows, listed([source for node in nodes[named:] for source in node])
+    return rows, []
 
 
 def _rows_for_category(
@@ -2012,6 +2139,9 @@ def _rows_for_category(
         if category in CREATURE_CATEGORIES:
             creature_names.update(source.name for source in rest if source.name)
         return [_named_row(source, strings, used_areas, areas) for source in rest]
+
+    if category in NODE_CATEGORIES:
+        return _node_rows(category, ranked, listed, strings, used_areas, areas, counts)
 
     if category == CAT_VENDOR and len(ranked) > VENDOR_SUMMARY_AT:
         # Rule 3: three arbitrary vendors out of 184 say less than the count does. The count
@@ -2639,7 +2769,11 @@ def header_lines(table: EraSources) -> list[str]:
         "mp = { [string index] = packed map pins }, zm = { [areaId] = uiMapId }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... } }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
-        "chance first inside a category, the summary row last. Never sort it.",
+        "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
+        "(c=8, 9) is listed NODE by node: one row per zone the node stands in, a node's zone "
+        "rows together (commonest zone first), the nodes best chance first then by name. Its "
+        f"cap counts nodes, not rows: {MAX_NAMED_ROWS} named nodes, t is the NODE count, and "
+        "its x list holds the remaining nodes' rows in the same order.",
         "row = { c category, n name (index into s), a areaId, p chance, q questId, f faction, "
         "m {further quests}, i container item id, k vendor stock, o quest only, t how many "
         "in all, lo/hi level band }",
@@ -2659,7 +2793,8 @@ def header_lines(table: EraSources) -> list[str]:
         "carries no string and the addon can draw it as a real edge.",
         "a: the area, as an id THIS build's AreaTable names; z[a] is its index into s. For "
         "c=10 with no n the area IS the fishing zone, stated first hand by the source. Where a "
-        "creature's every spawn is on one instance map, a is that INSTANCE's own area, taken "
+        "creature's (or a herb's or a vein's) every spawn is on one instance map, a is that "
+        "INSTANCE's own area, taken "
         "from this build's Map table: such an area has no entry in zm and no pins in mp, and "
         "the addon says the creature is inside it rather than drawing a map.",
         "p: the chance as a percentage to one decimal place. Absent where the source states "
