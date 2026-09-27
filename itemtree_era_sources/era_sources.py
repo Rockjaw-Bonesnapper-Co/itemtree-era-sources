@@ -804,8 +804,14 @@ class EraSources:
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
 
-    def module_value(self) -> dict:
-        return {
+    def module_value(self, generated: str | None = None) -> dict:
+        """The module table. `generated` is the compile's stamp, the same one the header prints.
+
+        It ships as `g` (brief E85) so the addon can read at run time which compile a table came
+        from: a guess module's creature references index `s` and hold only against the table
+        they were compiled with. Left out when no stamp is given, as the unit tests do.
+        """
+        value = {
             "s": list(self.strings),
             "z": dict(self.areas),
             "r": dict(self.rows),
@@ -820,6 +826,9 @@ class EraSources:
             "x": dict(self.list_index),
             "xl": list(self.lists),
         }
+        if generated:
+            value["g"] = generated
+        return value
 
 
 # ----- fetching and verifying the pinned files -----------------------------------------------
@@ -3155,7 +3164,8 @@ def header_lines(table: EraSources) -> list[str]:
         "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
         "ok = { [string index] = object category }, qg = { [string index] = { starts, ends } }, "
         "zm = { [areaId] = uiMapId }, "
-        "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... } }",
+        "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
+        "g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
         "(c=8, 9) is listed NODE by node: one row per zone the node stands in, a node's zone "
