@@ -42,6 +42,7 @@ import json
 import math
 import re
 import sqlite3
+import unicodedata
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -310,6 +311,42 @@ def normalise(name: str) -> str:
     return text[4:] if text.startswith("the ") else text
 
 
+def folded(name: str) -> str:
+    """A name with its diacritics dropped and its curly apostrophes made straight, so that
+    "Rath’mäel" and "Rath'mael" normalise alike."""
+    text = unicodedata.normalize("NFKD", name)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text.replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+
+
+def _kill_form(text: str) -> str | None:
+    """The name a "Kill <name>" text names, or None where the text does not read that way."""
+    text = folded(text).strip()
+    return text[5:] if text.casefold().startswith("kill ") else None
+
+
+def criteria_key(text: str) -> str:
+    """The matching key of an achievement text or an encounter name: folded, "Kill " dropped
+    from the front, then normalise (so "Kill Rathmael" and "Rath'mael" meet)."""
+    killed = _kill_form(text)
+    return normalise(killed if killed is not None else folded(text))
+
+
+def criteria_index(criteria: Iterable[KillCriterion]) -> dict[str, frozenset[int]]:
+    """Matching key -> every creature a kill criterion names under it. A criterion's own tree
+    texts count as the name or "Kill <name>"; a parent's text counts only in the "Kill" form,
+    since a parent is otherwise an achievement or a place ("Novice Spelunker")."""
+    found: dict[str, set[int]] = defaultdict(set)
+    for criterion in criteria:
+        if criterion.creature <= 0:
+            continue
+        keys = {criteria_key(text) for text in criterion.texts}
+        keys.update(normalise(killed) for text in criterion.parents if (killed := _kill_form(text)))
+        for key in keys - {""}:
+            found[key].add(criterion.creature)
+    return {key: frozenset(ids) for key, ids in found.items()}
+
+
 def _one_edit_apart(a: str, b: str) -> bool:
     """Whether two strings differ by at most one inserted, removed or changed character, or by
     two neighbouring characters swapped ("Geilhast" for "Gelihast")."""
@@ -470,6 +507,18 @@ class NewBossRow:
     sources: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class KillCriterion:
+    """One `Criteria` row of Type 0 (kill a creature, `Asset` the creature id) with the
+    `Description_lang` of each `CriteriaTree` row that holds it (`texts`) and of each such
+    row's parent (`parents`): "Shade of the Archmage" under "Kill Shade of the Archmage"."""
+
+    id: int
+    creature: int
+    texts: tuple[str, ...] = ()
+    parents: tuple[str, ...] = ()
+
+
 @dataclass
 class BossLootInput:
     """Everything the stage reads from the client builds, beside the EraInput it shares with
@@ -495,6 +544,9 @@ class BossLootInput:
     # creature id or 0), and the source that answered ("" for none).
     client_models: dict[int, tuple[int, int]] = field(default_factory=dict)
     client_source: str = ""
+    # The build's achievement kill criteria (Criteria Type 0 with their CriteriaTree texts),
+    # the client's own word on which creature a name is.
+    kill_criteria: list[KillCriterion] = field(default_factory=list)
     # curated/new_bosses.json, the rows that passed: encounter id -> the row.
     curated_bosses: dict[int, NewBossRow] = field(default_factory=dict)
     # Every cache file left out, cache disagreement and curated row refused, for the summary.
@@ -546,6 +598,10 @@ class BossLoot:
     notes: list[dict] = field(default_factory=list)
     # (place, entry) for each Era encounter left out for having no creature and no loot.
     empty: list[tuple[str, str]] = field(default_factory=list)
+    # Per new encounter named, in draw order: {encounter, name, creature, provenance}.
+    naming: list[dict] = field(default_factory=list)
+    # Criteria conflicts and curated rows refused while naming, for the summary.
+    naming_notes: list[str] = field(default_factory=list)
 
     def module_value(self) -> dict:
         return {
@@ -664,9 +720,15 @@ class _Stage:
         self.named: dict[str, int] = {
             "namedByClient": 0,
             "modelsByClient": 0,
+            "namedByCriteria": 0,
             "namedByCache": 0,
             "namedByCurated": 0,
+            "criteriaConflicts": 0,
         }
+        self.criteria = criteria_index(facts.kill_criteria)
+        # Which input named each new encounter, and what naming refused, for the summary.
+        self.naming: list[dict] = []
+        self.naming_notes: list[str] = []
 
     # ----- items ---------------------------------------------------------------------------
 
@@ -771,7 +833,8 @@ class _Stage:
     def name_new_boss(self, entry: _Entry) -> None:
         """c, cd and ct for an encounter new in Forever that nothing else named: the build's own
         encounter models first (cd, and c where the table gives a creature), then the client's
-        creature cache, then curated/new_bosses.json. The entry stays new (g = 1)."""
+        the build's achievement kill criteria, then the creature cache, then
+        curated/new_bosses.json. The entry stays new (g = 1)."""
         display, creature = self.facts.client_models.get(entry.encounter, (0, 0))
         display = display if display in self.era.display_ids else 0
         if creature > 0 and creature not in self.era.creatures and creature not in self.cache_used:
@@ -781,12 +844,58 @@ class _Stage:
             entry.creature_type = seen.creature_type if seen else 0
             entry.display = display or self.cached_display(creature)
             self.named["namedByClient"] += 1
+            self._record(entry, PROVENANCE_CLIENT)
             return
         if display:
             self.named["modelsByClient"] += 1
-        self._name_from_cache_or_curated(entry)
+        if not self._name_from_criteria(entry):
+            self._name_from_cache_or_curated(entry)
         if display:
             entry.display = display
+
+    def _record(self, entry: _Entry, provenance: str) -> None:
+        self.naming.append(
+            {
+                "encounter": entry.encounter,
+                "name": entry.name,
+                "creature": entry.creatures[0],
+                "provenance": provenance,
+            }
+        )
+
+    def _name_from_criteria(self, entry: _Entry) -> bool:
+        """The creature a kill criterion names under the encounter's name, where exactly one
+        does. Two or more is a conflict: none is taken, and the summary lists it."""
+        found = self.criteria.get(criteria_key(entry.name), frozenset())
+        if len(found) > 1:
+            self.named["criteriaConflicts"] += 1
+            ids = ", ".join(str(cid) for cid in sorted(found))
+            self.naming_notes.append(
+                f"criteria conflict: encounter {entry.encounter} ({entry.name}) is named by "
+                f"creatures {ids}; none taken"
+            )
+            return False
+        if not found:
+            return False
+        (creature,) = found
+        if creature in self.era.creatures or creature in self.cache_used:
+            return False
+        self.cache_used.add(creature)
+        entry.creatures = (creature,)
+        entry.display = self.cached_display(creature)
+        seen = self.facts.cached_creatures.get(creature)
+        entry.creature_type = seen.creature_type if seen else 0
+        row = self.facts.curated_bosses.get(entry.encounter)
+        if row is not None and row.creature != creature:
+            self.naming_notes.append(
+                f"new bosses: encounter {entry.encounter} ({entry.name}): the row names creature "
+                f"{row.creature}, the client's achievement criteria {creature}; the row is refused"
+            )
+        elif row is not None and not entry.display and row.display in self.era.display_ids:
+            entry.display = row.display
+        self.named["namedByCriteria"] += 1
+        self._record(entry, PROVENANCE_CRITERIA)
+        return True
 
     def _name_from_cache_or_curated(self, entry: _Entry) -> None:
         cached = self.cached_named(entry.name)
@@ -796,6 +905,7 @@ class _Stage:
             entry.display = self.cached_display(cached.id)
             entry.creature_type = cached.creature_type
             self.named["namedByCache"] += 1
+            self._record(entry, PROVENANCE_CACHE)
             return
         row = self.facts.curated_bosses.get(entry.encounter)
         if row is None or row.creature in self.era.creatures or row.creature in self.cache_used:
@@ -808,6 +918,7 @@ class _Stage:
         seen = self.facts.cached_creatures.get(row.creature)
         entry.creature_type = seen.creature_type if seen else 0
         self.named["namedByCurated"] += 1
+        self._record(entry, PROVENANCE_CURATED)
 
     def lives_on(self, cid: int, map_id: int) -> bool:
         """Whether every always there spawn of the creature is on this one map."""
@@ -1481,6 +1592,8 @@ def derive(
         dropped=stage.dropped,
         notes=notes,
         empty=stage.empty,
+        naming=stage.naming,
+        naming_notes=stage.naming_notes,
     )
 
 
@@ -1685,6 +1798,43 @@ def client_encounter_models(conn: sqlite3.Connection, build: str) -> tuple[str, 
 
 
 NEW_BOSSES_PROVENANCE = "community"
+# Which input named a new encounter, as BossLoot.naming records it.
+PROVENANCE_CLIENT = "client tables"
+PROVENANCE_CRITERIA = "client criteria"
+PROVENANCE_CACHE = "creature cache"
+PROVENANCE_CURATED = "curated"
+# Criteria.Type for "kill a creature", whose Asset is the creature id.
+CRITERIA_KILL_CREATURE = 0
+
+
+def client_kill_criteria(conn: sqlite3.Connection, build: str) -> list[KillCriterion]:
+    """Every kill criterion of the build (Criteria Type 0, Asset > 0) that a CriteriaTree row
+    holds, with that row's text and its parent's. Empty where the tables are not loaded. A
+    lookup of what is loaded only; nothing is fetched."""
+    if not (
+        {"ID", "Type", "Asset"} <= _columns(conn, "Criteria")
+        and {"ID", "Description_lang", "Parent", "CriteriaID"} <= _columns(conn, "CriteriaTree")
+    ):
+        return []
+    rows = conn.execute(
+        "SELECT c.ID, c.Asset, t.Description_lang, p.Description_lang FROM Criteria c "
+        "JOIN CriteriaTree t ON t.CriteriaID = c.ID AND t.build_id = c.build_id "
+        "LEFT JOIN CriteriaTree p ON p.ID = t.Parent AND p.build_id = t.build_id "
+        "WHERE c.build_id = ? AND c.Type = ? AND c.Asset > 0 ORDER BY c.ID, t.ID",
+        (build, CRITERIA_KILL_CREATURE),
+    )
+    found: dict[int, tuple[int, list[str], list[str]]] = {}
+    for row in rows:
+        creature, texts, parents = found.setdefault(_int(row[0]), (_int(row[1]), [], []))
+        for text, into in ((row[2], texts), (row[3], parents)):
+            if text and str(text) not in into:
+                into.append(str(text))
+    return [
+        KillCriterion(id=cid, creature=creature, texts=tuple(texts), parents=tuple(parents))
+        for cid, (creature, texts, parents) in found.items()
+    ]
+
+
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -1880,6 +2030,12 @@ def gather_input(
         if client_source
         else "no client encounter models on this build"
     )
+    kill_criteria = client_kill_criteria(conn, build)
+    notes.append(
+        f"client achievement criteria: {len(kill_criteria)} kill criteria"
+        if kill_criteria
+        else "no achievement kill criteria on this build"
+    )
     merged = cache_mod.read_many(list(creature_caches), build=build)
     notes.extend(merged.notes)
     curated: dict[int, NewBossRow] = {}
@@ -1901,6 +2057,7 @@ def gather_input(
         ui_map_assignments=ui_map_assignments,
         client_models=client_models,
         client_source=client_source,
+        kill_criteria=kill_criteria,
         cached_creatures=merged.creatures,
         cache_files=len(merged.files_read),
         curated_bosses=curated,
