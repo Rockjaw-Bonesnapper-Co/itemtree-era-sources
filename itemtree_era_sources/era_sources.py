@@ -34,6 +34,19 @@ tables to one number (1 Alliance, 2 Horde, 3 both) and shipped in `cf`, so a rec
 vendor is Alliance can say so. Every recipe vendor is a vendor the table names, so the recipe
 sources are covered by the same rule. Nothing else about a faction is shipped.
 
+Since brief P6a three more tables are read, for the trainers: `npc_trainer` (a creature id and a
+spell id per row), `npc_trainer_template` (a template id and a spell id per row, joined to a
+creature through `creature_template.TrainerTemplateId`) and, from `spell_template`, the id, the
+three `Effect` columns and the three `EffectTriggerSpell` columns and nothing else, to turn a
+trainer's "learn" spell into the spell it teaches. Ids only: no spell name, no description, no
+cost, no required level or skill. A taught spell is kept only where THIS build's own
+`SkillLineAbility` files it under a profession or secondary skill line (the coordinator's decision
+on brief P6a: ItemTree's trainer rows are about recipes, a class trainer teaches no item, and the
+class trainers' 27,038 pairs would have taken the file past 1.6 MB), and the list ships
+per trainer NAME in `tr`, so a trainer's page can say what it teaches and a spell's sources can
+name its trainers. A trainer is a creature the table lists, so it gets its portrait, pins, title
+and side through the same paths a vendor does.
+
 The pins are the one reversal of an old rule, and they are narrow. Until 2026-09-20 this module
 stored no coordinate at all. It now reduces each creature's spawns, per zone, to at most six
 points on a grid of five percent of that zone's map, quantised to a tenth of a percent, so that
@@ -174,10 +187,11 @@ RETIRED_INPUTS: tuple[str, ...] = ()
 CREDIT = (
     "Historical Classic Era source data, derived from the CMaNGOS Classic content database "
     "(github.com/cmangos/classic-db), which the MaNGOS community compiled for World of "
-    "Warcraft patch 1.12. Creature, object and quest names, vendor and quest giver titles and "
-    "their factions (reduced to Alliance, Horde or both through the client's own faction "
-    "tables) are that database's own. Drop chances are that database's own loot table "
-    "figures. Map pins are reduced from that database's own spawn positions. Creature and object zones come "
+    "Warcraft patch 1.12. Creature, object and quest names, vendor, trainer and quest giver "
+    "titles and their factions (reduced to Alliance, Horde or both through the client's own "
+    "faction tables) and which spells a trainer teaches are that database's own. Drop chances "
+    "are that database's own loot table figures. Map pins are reduced from that database's own "
+    "spawn positions. Creature and object zones come "
     "from pfQuest's vanilla database (github.com/shagu/pfQuest), which contributes the area "
     "id and nothing else. WoW Forever may differ; the addon shows these as predicted."
 )
@@ -187,8 +201,8 @@ CREDIT = (
 # data is Blizzard's, and neither claims ItemTree's own licence covers the upstream database.
 LICENCE_NOTE_FACTS = (
     "This module is a facts only derivation: ids, numbers, the names of creatures, objects "
-    "and places, vendor and quest giver titles and factions, and a handful of reduced map "
-    "points, re-expressed by the pipeline. No prose, "
+    "and places, vendor, trainer and quest giver titles and factions, the spell ids a "
+    "trainer teaches, and a handful of reduced map points, re-expressed by the pipeline. No prose, "
     "no descriptions, no quest text and no comments are taken from the source database, and "
     "none of its own text is reproduced here."
 )
@@ -420,6 +434,34 @@ KIND_VENDOR_BOTH = 1
 # run to 9,665 and two digits stop at 8,280.
 QG_QUEST_DIGITS = 3
 
+# ----- the trainers (brief P6a) ---------------------------------------------------------------
+#
+# A trainer's list in `tr` is the spell ids it teaches, each as TR_SPELL_DIGITS base 91 digits.
+# Three, because the 1.12 spell ids a trainer teaches run to about 30,000 and two digits stop at
+# 8,280; pack_int fails the build rather than wrap if one ever outgrows them.
+TR_SPELL_DIGITS = 3
+
+# `npc_trainer.spell` is usually the trainer's own "learn" spell rather than the spell the player
+# ends up with: its effect is SPELL_EFFECT_LEARN_SPELL and its EffectTriggerSpell is the real one
+# (the mage trainer's 1142 teaches 116 Frostbolt). The dump's own spell_template says which.
+SPELL_EFFECT_LEARN_SPELL = 36
+
+# SkillLine.CategoryID values: 7 the class trees and pet lines, 9 the secondary skills (Cooking,
+# First Aid, Fishing), 11 the professions. All three are READ from THIS build's own
+# SkillLineAbility (SKILL_CATEGORIES_READ), so a class spell is known and counted when it is
+# refused; only TRAINER_SKILL_CATEGORIES SHIP. The cut, decided on brief P6a: class trainers are
+# left out, because ItemTree's trainer rows are about recipes and a class trainer teaches no item,
+# and their 27,038 pairs took the file to 1,705,074 bytes, past its 1.6 MB budget. Adding 7 back
+# here is the whole of undoing it (see docs/era-sources.md).
+SKILL_CATEGORY_CLASS = 7
+SKILL_CATEGORY_SECONDARY = 9
+SKILL_CATEGORY_PROFESSION = 11
+SKILL_CATEGORIES_READ = frozenset({SKILL_CATEGORY_CLASS, SKILL_CATEGORY_SECONDARY, SKILL_CATEGORY_PROFESSION})
+TRAINER_SKILL_CATEGORIES = frozenset({SKILL_CATEGORY_SECONDARY, SKILL_CATEGORY_PROFESSION})
+# 2851 Engraving is a class category line holding the Season of Discovery rune engravings, which
+# no trainer in the 1.12 dump teaches and WoW Forever does not have.
+ENGRAVING_SKILL_LINE = 2851
+
 # ----- the map pins -----------------------------------------------------------------------
 #
 # Until 2026-09-20 this module stored no coordinate at all. It now ships a handful of pins per
@@ -537,6 +579,11 @@ def pack_quests(quests: Sequence[int]) -> str:
     return "".join(pack_int(quest, QG_QUEST_DIGITS) for quest in quests)
 
 
+def pack_spells(spells: Sequence[int]) -> str:
+    """A trainer's list (brief P6a): each spell id as TR_SPELL_DIGITS base 91 digits."""
+    return "".join(pack_int(spell, TR_SPELL_DIGITS) for spell in spells)
+
+
 # ----- the facts, as plain data so a fixture can hand build them ----------------------------
 
 
@@ -590,6 +637,9 @@ class CreatureFacts:
     vendor_template: int = 0
     subname: str = ""
     faction: int = 0
+    # Brief P6a: `TrainerTemplateId`, the npc_trainer_template entry this creature teaches from
+    # on top of its own npc_trainer rows. 0 for a creature that teaches from no template.
+    trainer_template: int = 0
 
 
 @dataclass(frozen=True)
@@ -790,6 +840,16 @@ class EraInput:
     # FACTION_BOTH), from THIS build's own FactionTemplate and Faction tables by faction_sides.
     # A template this build does not carry has no entry, and a creature on it gets no `cf`.
     faction_sides: dict[int, int] = field(default_factory=dict)
+    # Brief P6a, the trainers. `trainer_spells` is `npc_trainer` as (creature id, spell id) and
+    # `trainer_template_spells` is `npc_trainer_template` as (template id, spell id), both in the
+    # dump's order; `learned_spells` is spell_template's learn spells, spell id -> the spell it
+    # teaches. `skill_spells` is THIS build's own SkillLineAbility, spell id -> the SkillLine
+    # CategoryID it is filed under, for the TRAINER_SKILL_CATEGORIES lines only (a profession or
+    # secondary line wins over a class one where a spell is filed under both).
+    trainer_spells: list[tuple[int, int]] = field(default_factory=list)
+    trainer_template_spells: list[tuple[int, int]] = field(default_factory=list)
+    learned_spells: dict[int, int] = field(default_factory=dict)
+    skill_spells: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -829,6 +889,8 @@ class EraSources:
     subnames: dict[int, int] = field(default_factory=dict)
     # Brief T1: a vendor or quest giver NAME's index into `s` -> 1 Alliance, 2 Horde, 3 both.
     factions: dict[int, int] = field(default_factory=dict)
+    # Brief P6a: a trainer NAME's index into `s` -> the spell ids it teaches, packed by pack_spells.
+    trainers: dict[int, str] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
 
@@ -853,6 +915,7 @@ class EraSources:
             "zm": dict(self.area_maps),
             "st": dict(self.subnames),
             "cf": dict(self.factions),
+            "tr": dict(self.trainers),
             "x": dict(self.list_index),
             "xl": list(self.lists),
         }
@@ -977,6 +1040,11 @@ WANTED_TABLES = (
     # id and a quest id, and nothing else in either table.
     "creature_questrelation",
     "creature_involvedrelation",
+    # Brief P6a: which creature teaches which spell, directly or through a trainer template, and
+    # spell_template's learn effects to turn a trainer's learn spell into the spell it teaches.
+    "npc_trainer",
+    "npc_trainer_template",
+    "spell_template",
 )
 
 LOOT_TABLES = {
@@ -1251,7 +1319,24 @@ def _absorb(
             # An unquoted NULL is how the dump leaves a SubName out, on nearly every creature.
             subname="" if col("SubName") in (None, "NULL") else (col("SubName") or "").strip(),
             faction=_int(col("Faction") if col("Faction") is not None else col("FactionAlliance")),
+            trainer_template=_int(col("TrainerTemplateId")),
         )
+        return
+    if table in ("npc_trainer", "npc_trainer_template"):
+        # Brief P6a: the entry and the spell, and nothing else: not the cost, not the required
+        # skill, level or abilities, not the condition.
+        pair = (_int(col("entry")), _int(col("spell")))
+        (era.trainer_spells if table == "npc_trainer" else era.trainer_template_spells).append(pair)
+        return
+    if table == "spell_template":
+        # Brief P6a: the id and the three effects with their trigger spells, and only for a spell
+        # one of whose effects is a learn effect. No name, no text, nothing else of the spell.
+        for slot in (1, 2, 3):
+            if _int(col(f"Effect{slot}")) == SPELL_EFFECT_LEARN_SPELL:
+                taught = _int(col(f"EffectTriggerSpell{slot}"))
+                if taught > 0:
+                    era.learned_spells[_int(col("Id"))] = taught
+                    break
         return
     if table == "gameobject_template":
         oid = _int(col("entry"))
@@ -1747,6 +1832,43 @@ def read_faction_sides(conn: sqlite3.Connection, build: str) -> dict[int, int]:
         number(row, "ID"): number(row, "ParentFactionID") for row in _map_table(conn, build, "Faction", "*")
     }
     return faction_sides(templates, parents)
+
+
+def skill_spell_categories(
+    abilities: Sequence[tuple[int, int]], categories: Mapping[int, int]
+) -> dict[int, int]:
+    """spell id -> the SkillLine CategoryID a trainer's spell is filed under (brief P6a).
+
+    `abilities` is SkillLineAbility as (spell, skill line) and `categories` is SkillLine's id to
+    CategoryID. Only SKILL_CATEGORIES_READ lines count, and never the Engraving line. A spell
+    filed under a profession or secondary line and a class line both reads as the profession.
+    """
+    out: dict[int, int] = {}
+    for spell, line in abilities:
+        category = categories.get(line)
+        if spell <= 0 or line == ENGRAVING_SKILL_LINE or category not in SKILL_CATEGORIES_READ:
+            continue
+        current = out.get(spell)
+        if current is None or current == SKILL_CATEGORY_CLASS:
+            out[spell] = category
+    return dict(sorted(out.items()))
+
+
+def read_skill_spells(conn: sqlite3.Connection, build: str) -> dict[int, int]:
+    """THIS build's own SkillLineAbility and SkillLine, reduced by skill_spell_categories.
+
+    Read for the spell ids, the skill line ids and the category ids. No name, no rank, no class
+    mask and nothing else out of either table is read or shipped.
+    """
+    abilities = [
+        (int(row["Spell"] or 0), int(row["SkillLine"] or 0))
+        for row in _map_table(conn, build, "SkillLineAbility", '"Spell", "SkillLine"')
+    ]
+    categories = {
+        int(row["ID"] or 0): int(row["CategoryID"] or 0)
+        for row in _map_table(conn, build, "SkillLine", '"ID", "CategoryID"')
+    }
+    return skill_spell_categories(abilities, categories)
 
 
 _QUEST_BLOCK = re.compile(r"^  \[(\d+)\] = \{", re.MULTILINE)
@@ -3055,6 +3177,7 @@ def _titles_and_sides(
     names: set[str],
     strings: _Strings,
     counts: dict[str, int],
+    trainers: Collection[int] = (),
 ) -> tuple[dict[int, int], dict[int, int]]:
     """Brief T1: a vendor or quest giver NAME's index into `s` -> (its SubName's index into `s`,
     its side), for the names given and no other.
@@ -3065,8 +3188,13 @@ def _titles_and_sides(
     the lowest creature id. The side is the one every such creature's template agrees on, and 3
     (both) where they disagree; a creature on a template this build does not carry says nothing,
     and a name none of whose creatures can be read has no `cf` entry at all.
+
+    Brief P6a: the names now include the trainers, and `trainers` is the creature ids that teach.
+    Where no creature of a name sells anything, the ones that teach speak for it next, so a
+    trainer's title is its "Journeyman Enchanter" rather than some quest giver's of its name.
     """
     sellers = _vendor_creatures(era_input)
+    teachers = set(trainers)
     by_name: dict[str, list[CreatureFacts]] = defaultdict(list)
     for creature_id in sorted(era_input.creatures):
         facts = era_input.creatures[creature_id]
@@ -3077,7 +3205,11 @@ def _titles_and_sides(
     conflicts = 0
     for name in sorted(by_name):
         creatures = by_name[name]
-        speaking = [facts for facts in creatures if facts.id in sellers] or creatures
+        speaking = (
+            [facts for facts in creatures if facts.id in sellers]
+            or [facts for facts in creatures if facts.id in teachers]
+            or creatures
+        )
         titles = Counter(facts.subname for facts in speaking if facts.subname)
         if titles:
             first = {}
@@ -3100,6 +3232,71 @@ def _titles_and_sides(
     for side, label in ((FACTION_ALLIANCE, "Alliance"), (FACTION_HORDE, "Horde"), (FACTION_BOTH, "Both")):
         counts[f"factions{label}"] = sum(1 for value in sides.values() if value == side)
     return subnames, sides
+
+
+def trainer_creature_spells(era_input: EraInput) -> dict[int, set[int]]:
+    """creature id -> every spell id it teaches, before any reduction (brief P6a).
+
+    A creature teaches its own `npc_trainer` rows and every row of the `npc_trainer_template`
+    entry its TrainerTemplateId names. A learn spell (see SPELL_EFFECT_LEARN_SPELL) stands for the
+    spell it teaches, which is the one a player, the build and the addon know it by.
+    """
+    templates: dict[int, set[int]] = defaultdict(set)
+    for template, spell in era_input.trainer_template_spells:
+        templates[template].add(spell)
+    taught: dict[int, set[int]] = defaultdict(set)
+    for creature, spell in era_input.trainer_spells:
+        taught[creature].add(spell)
+    for creature_id, facts in era_input.creatures.items():
+        if facts.trainer_template and templates.get(facts.trainer_template):
+            taught[creature_id] |= templates[facts.trainer_template]
+    learned = era_input.learned_spells
+    return {
+        creature: {learned.get(spell, spell) for spell in spells if spell > 0}
+        for creature, spells in sorted(taught.items())
+        if creature > 0
+    }
+
+
+def _trainer_lists(
+    era_input: EraInput,
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> tuple[dict[str, tuple[int, ...]], set[int]]:
+    """A trainer NAME -> the spell ids its creatures teach, ascending (brief P6a), and the ids
+    of the creatures that stand behind those names.
+
+    Keyed by the name, the way `ck`, `qg` and `st` are: every creature called "Kitta Firewind"
+    is the same trainer to a player. Reduced to spells THIS build's own SkillLineAbility files
+    under a profession or secondary line (TRAINER_SKILL_CATEGORIES), so no spell id the client
+    cannot name ships; a class spell the build knows is refused by the cut and counted under
+    `trainerSpellClass`, so a class trainer ships nothing. A creature with no name, or a
+    scaffolding one, teaches nothing that ships: there is no page to open it on.
+    """
+    known = era_input.skill_spells
+    lists: dict[str, set[int]] = defaultdict(set)
+    teachers: set[int] = set()
+    for creature, spells in trainer_creature_spells(era_input).items():
+        facts = era_input.creatures.get(creature)
+        if facts is None or not facts.name or is_scaffolding(facts.name):
+            dropped["trainerUnnamed"] += 1
+            continue
+        kept = {spell for spell in spells if known.get(spell) in TRAINER_SKILL_CATEGORIES}
+        classed = sum(1 for spell in spells if spell in known and spell not in kept)
+        dropped["trainerSpellClass"] += classed
+        dropped["trainerSpellUnknown"] += len(spells) - len(kept) - classed
+        if not kept:
+            dropped["trainerNothingKnown"] += 1
+            continue
+        lists[facts.name] |= kept
+        teachers.add(creature)
+    out = {name: tuple(sorted(lists[name])) for name in sorted(lists)}
+    pairs = [(name, spell) for name, spells in out.items() for spell in spells]
+    counts["trainerNames"] = len(out)
+    counts["trainerCreatures"] = len(teachers)
+    counts["trainerPairs"] = len(pairs)
+    counts["trainerSpells"] = len({spell for _name, spell in pairs})
+    return out, teachers
 
 
 def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] = ()) -> EraSources:
@@ -3129,6 +3326,10 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         "questGiverNotShipped": 0,
         "questGiverUntitled": 0,
         "questGiverScaffolding": 0,
+        "trainerUnnamed": 0,
+        "trainerSpellUnknown": 0,
+        "trainerSpellClass": 0,
+        "trainerNothingKnown": 0,
     }
     counts: dict[str, int] = {
         "multiQuest": 0,
@@ -3201,7 +3402,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # portrait and a map. One entry per name: a name that is a creature and a vendor both is one
     # kind, one display and one set of pins, and its kind says it is both.
     vendor_names = _vendor_names(entries, leftovers, strings)
-    npc_names = creature_names | vendor_names
+    # Brief P6a: a trainer's name joins them too, so a trainer's page has a portrait, a map, a
+    # title and a side. A trainer's kind stays a plain kind: `tr` is what says it teaches.
+    trainer_lists, teachers = _trainer_lists(era_input, counts, dropped)
+    trainer_names = set(trainer_lists)
+    npc_names = creature_names | vendor_names | trainer_names
     kinds = _creature_kinds(era_input, npc_names, strings, counts)
     for index in kinds:
         name = strings.value(index)
@@ -3222,8 +3427,9 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # Brief T1, the owner's ruling of 2026-09-27: the title under the name and the side, for the
     # vendors and the quest givers and enders the table names, and no other creature. Every
     # recipe's vendor is one of those vendors, so "Alliance only" on a recipe needs nothing more.
-    titled_names = vendor_names | {strings.value(index) for index in givers}
-    subnames, sides = _titles_and_sides(era_input, titled_names, strings, counts)
+    titled_names = vendor_names | trainer_names | {strings.value(index) for index in givers}
+    subnames, sides = _titles_and_sides(era_input, titled_names, strings, counts, teachers)
+    trainers = {strings.add(name): spells for name, spells in trainer_lists.items()}
     # The pins go last, because a pin's own area is an area the player can now read and so has to
     # reach `z` and `s` before the string table is sorted.
     pins = _creature_pins(era_input, npc_names, strings, used_areas, counts, dropped)
@@ -3235,6 +3441,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     counts["vendorPins"] = sum(
         len(made) for index, made in pins.items() if strings.value(index) in vendor_names
     )
+    counts["trainerNamesSharedWithOthers"] = len(trainer_names & (creature_names | vendor_names))
+    counts["trainerDisplays"] = sum(1 for index in displays if index in trainers)
+    counts["trainerPinNames"] = sum(1 for index in pins if index in trainers)
+    counts["trainerTitles"] = sum(1 for index in subnames if index in trainers)
+    counts["trainerSides"] = sum(1 for index in sides if index in trainers)
     # The object pins (brief D7), for every object name a shipped row or list names. Shipped in
     # `op` rather than in `mp`: `s` is one string table, and a name can be a creature's and an
     # object's both, so one table keyed by name could not say whose pins it holds.
@@ -3261,6 +3472,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     kinds = {remap[index]: packed for index, packed in kinds.items()}
     subnames = {remap[index]: remap[title] for index, title in subnames.items()}
     sides = {remap[index]: side for index, side in sides.items()}
+    trainers_out = {remap[index]: pack_spells(spells) for index, spells in trainers.items()}
     displays = {remap[index]: display for index, display in displays.items()}
     givers_out = {
         remap[index]: (pack_quests(starts), pack_quests(ends)) for index, (starts, ends) in givers.items()
@@ -3351,6 +3563,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         quest_givers=dict(sorted(givers_out.items())),
         subnames=dict(sorted(subnames.items())),
         factions=dict(sorted(sides.items())),
+        trainers=dict(sorted(trainers_out.items())),
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -3379,7 +3592,7 @@ def header_lines(table: EraSources) -> list[str]:
         "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
         "ok = { [string index] = object category }, qg = { [string index] = { starts, ends } }, "
         "zm = { [areaId] = uiMapId }, st = { [string index] = string index }, "
-        "cf = { [string index] = side }, "
+        "cf = { [string index] = side }, tr = { [string index] = packed spell ids }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
         "g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
@@ -3428,7 +3641,8 @@ def header_lines(table: EraSources) -> list[str]:
         "ck: what kind of creature a NAME is, one integer per name: CreatureType + "
         f"{KIND_TYPE_SPAN} * (MinLevel + {KIND_LEVEL_SPAN} * (MaxLevel less MinLevel + "
         f"{KIND_BAND_SPAN} * beast Family)). Present for the names c=1, 6, 7 and 12 rows and "
-        "their x lists use, and for the vendor names c=4 rows and lists use. A vendor's is "
+        "their x lists use, for the vendor names c=4 rows and lists use, and for the trainer "
+        "names tr carries (a trainer's is a plain kind). A vendor's is "
         "NEGATIVE, -(2 * kind + both + 1), both 1 where the name is a creature row's too. Where "
         "two creatures share a name, the commoner type and the widest level band.",
         "cd: the CreatureDisplayInfo id the client draws that NAME's portrait from, keyed the "
@@ -3462,14 +3676,22 @@ def header_lines(table: EraSources) -> list[str]:
         "resolves to one. Absent means this build has no map for that area, which is every "
         "instance root area: this build ships no dungeon map at all, so a creature inside one "
         "has no pin and no map and the addon says so rather than guessing an entrance. "
-        "st: the title under a vendor's or a quest giver's NAME (creature_template.SubName, "
-        "such as Cooking Supplies), as an index into s, keyed the way ck is. Present only for the "
-        "vendor names c=4 rows and lists use and the names qg carries, and only where the source "
-        "states one. Where creatures share a name, a vendor's title wins, then the commonest. "
-        "cf: the side a vendor's or a quest giver's NAME is on, keyed the way st is: 1 Alliance, 2 "
-        "Horde, 3 both, from creature_template.Faction through THIS build's own FactionTemplate "
-        "and Faction tables. Neutral (Booty Bay, Gadgetzan) is 3. Where creatures of one name "
-        "disagree, 3. Absent means the build could not say.",
+        "st: the title under a vendor's, a trainer's or a quest giver's NAME "
+        "(creature_template.SubName, such as Cooking Supplies), as an index into s, keyed the way "
+        "ck is. Present only for the vendor names c=4 rows and lists use, the names tr and qg "
+        "carry, and only where the source states one. Where creatures share a name, a vendor's "
+        "title wins, then a trainer's, then the commonest. "
+        "cf: the side a vendor's, a trainer's or a quest giver's NAME is on, keyed the way st "
+        "is: 1 Alliance, 2 Horde, 3 both, from creature_template.Faction through THIS build's "
+        "own FactionTemplate and Faction tables. Neutral (Booty Bay, Gadgetzan) is 3. Where "
+        "creatures of one name disagree, 3. Absent means the build could not say. "
+        "tr: the spells a trainer NAME teaches (npc_trainer, and npc_trainer_template through "
+        "creature_template.TrainerTemplateId, a learn spell read as the spell it teaches by "
+        "spell_template's learn effect), keyed the way ck is: one packed string, each spell id as "
+        f"{TR_SPELL_DIGITS} base 91 digits, ascending. Only spells THIS build's SkillLineAbility "
+        "files under a profession or secondary skill line: no class trainer. A spell's trainers "
+        "are the "
+        "names whose list holds it.",
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "
         "searched. x[itemId][c] is a 1 based number into xl, and xl holds each distinct list "
         "once. A list is a run of fixed width records of base 91 digits (the bytes 35 to 126 "
@@ -3498,7 +3720,10 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('listsShipped', 0)} lists, stored as {counts.get('listsStored', 0)} "
         f"distinct packed strings; {counts.get('subnames', 0)} titles in st and "
         f"{counts.get('factions', 0)} sides in cf (Alliance {counts.get('factionsAlliance', 0)}, "
-        f"Horde {counts.get('factionsHorde', 0)}, both {counts.get('factionsBoth', 0)}).",
+        f"Horde {counts.get('factionsHorde', 0)}, both {counts.get('factionsBoth', 0)}); "
+        f"{counts.get('trainerNames', 0)} trainers in tr ({counts.get('trainerCreatures', 0)} "
+        f"creatures) teaching {counts.get('trainerPairs', 0)} name and spell pairs over "
+        f"{counts.get('trainerSpells', 0)} spells, profession and secondary only.",
         f"{counts.get('pins', 0)} map pins in mp over {counts.get('pinNames', 0)} names and "
         f"{counts.get('pinGroups', 0)} name and area groups, standing for "
         f"{counts.get('pinSpawnsPlaced', 0)} spawns; {counts.get('objectPins', 0)} object map pins "
@@ -3544,5 +3769,6 @@ def gather_input(
     era_input.map_bounds = map_bounds(conn, build)
     era_input.instance_areas = instance_areas(conn, build, era_input.areas)
     era_input.faction_sides = read_faction_sides(conn, build)
+    era_input.skill_spells = read_skill_spells(conn, build)
     era_input.curated_quests = read_curated_quests(curated_quests_path)
     return era_input
