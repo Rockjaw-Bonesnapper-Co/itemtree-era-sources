@@ -88,6 +88,26 @@ BAND_COUNT = 6
 BAND_UNKNOWN = BAND_COUNT + 1
 # instance_encounters.creditType 0: the credit is a creature kill.
 CREDIT_KILL = 0
+# The UiMap types the location chain reads, as the client's Enum.UIMapType names them: a
+# continent (2), a zone (3), a dungeon (4) and an orphan (6).
+UI_MAP_CONTINENT = 2
+UI_MAP_ZONE = 3
+UI_MAP_DUNGEON = 4
+UI_MAP_ORPHAN = 6
+# Where a place is, as words (brief BL13a): the source each place's ez and ec came from.
+WHERE_UI_MAP = "a"
+WHERE_ENTRANCE = "b"
+WHERE_AREA = "c"
+WHERE_NONE = ""
+# The entrance position's tie break: how many of pfQuest's nearest zoned spawns vote.
+NEAREST_SPAWNS = 9
+# pfQuest lists a spawn it cannot place in one zone in both (every creature of Blackrock
+# Mountain is in Searing Gorge AND Burning Steppes), and the two copies land within a yard or
+# two of each other. A spawn with another zone's spawn this close says nothing and is dropped.
+SHARED_SPAWN_YARDS = 4.0
+# A same name outdoor area is matched only where the shorter of the two names is this long, so
+# "The Den" never names Starfall Barrow Den and "The Maul" is not read as Dire Maul.
+NAMESAKE_MIN_CHARS = 6
 # The shipped file may not grow past this. The plan estimates 60 to 110 KB.
 MAX_FILE_BYTES = 200 * 1024
 
@@ -353,6 +373,14 @@ class MapFacts:
     instance_type: int
     max_players: int = 0
     area: int = 0
+    # Where a ghost is put back when it releases, which is outside the entrance: the continent
+    # map (-1 for none) and the world position on it (0, 0 where the row states none).
+    corpse_map: int = -1
+    corpse_x: float = 0.0
+    corpse_y: float = 0.0
+    # The map the world map draws this one under (-1 for none), which on this build is the
+    # continent for three places new in Forever.
+    cosmetic_parent: int = -1
 
 
 @dataclass(frozen=True)
@@ -408,6 +436,26 @@ class AreaFacts:
     tuning: int = 0
 
 
+@dataclass(frozen=True)
+class UiMapFacts:
+    """One `UiMap` row: its localised name, its parent map and its type."""
+
+    id: int
+    name: str
+    parent: int = 0
+    type: int = 0
+
+
+@dataclass(frozen=True)
+class Location:
+    """Where a place is, as words: its entrance zone, its continent and the source (a, b, c or
+    none) they came from. Either name may be empty."""
+
+    zone: str = ""
+    continent: str = ""
+    source: str = WHERE_NONE
+
+
 @dataclass
 class BossLootInput:
     """Everything the stage reads from the client builds, beside the EraInput it shares with
@@ -421,6 +469,10 @@ class BossLootInput:
     tuning: dict[int, TuningFacts] = field(default_factory=dict)
     areas: dict[int, AreaFacts] = field(default_factory=dict)
     credits: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    # The UiMap chain (brief BL13a, source a): every UiMap row, and (UiMap id, map id) for every
+    # UiMapAssignment row, which is what ties a UiMap to the map it draws.
+    ui_maps: dict[int, UiMapFacts] = field(default_factory=dict)
+    ui_map_assignments: tuple[tuple[int, int], ...] = ()
 
 
 class ItemFacts(Protocol):
@@ -579,6 +631,8 @@ class _Stage:
         self.used: set[int] = set()
         # Scaffolding names met, each counted once however often a rule looks at it.
         self.scaffolding: set[tuple[str, int]] = set()
+        # pfQuest's zoned spawns as world positions, built the first time a tie needs them.
+        self.points: list[tuple[int, float, float, int]] | None = None
 
     # ----- items ---------------------------------------------------------------------------
 
@@ -816,6 +870,44 @@ class _Stage:
             )
         return out
 
+    # ----- where a place is ------------------------------------------------------------------
+
+    def location(self, map_facts: MapFacts, area_id: int) -> Location:
+        """A place's entrance zone and continent, from the first source that answers: a the
+        UiMap chain, b the entrance position inside exactly one zone's corners, c the AreaTable
+        (which has to agree with the corners where the Map row states a position), b again with
+        the nearest pfQuest spawns breaking the tie, and last the continent alone, from
+        CorpseMapID or CosmeticParentMapID."""
+        facts = self.facts
+        found = location_from_ui_map(facts, map_facts.id)
+        if found is not None:
+            return found
+        candidates = entrance_zones(map_facts, self.era.map_bounds)
+        corpse_continent = continent_name(facts, map_facts.corpse_map)
+        if len(candidates) == 1 and candidates[0] in facts.ui_maps:
+            return Location(facts.ui_maps[candidates[0]].name, corpse_continent, WHERE_ENTRANCE)
+        zone = zone_from_area(facts, map_facts, area_id)
+        if zone is not None and (not candidates or self.era.area_maps.get(zone.id) in candidates):
+            return Location(zone.name, continent_name(facts, zone.continent), WHERE_AREA)
+        if len(candidates) > 1:
+            if self.points is None:
+                self.points = zoned_points(self.era)
+            nearest = nearest_zone(map_facts, candidates, self.points)
+            if nearest in facts.ui_maps:
+                return Location(facts.ui_maps[nearest].name, corpse_continent, WHERE_ENTRANCE)
+        continent = corpse_continent or continent_name(facts, map_facts.cosmetic_parent)
+        if continent:
+            return Location("", continent, WHERE_ENTRANCE)
+        return Location()
+
+    def world_boss_continent(self, zones: Sequence[int]) -> str:
+        """The continent every one of a world boss's zones lies on, by this build's AreaTable,
+        or "" where one is unknown or they differ."""
+        continents = {self.facts.areas[z].continent for z in zones if z in self.facts.areas}
+        if not zones or len(continents) != 1 or any(z not in self.facts.areas for z in zones):
+            return ""
+        return continent_name(self.facts, next(iter(continents)))
+
     def zone_continents(self, cid: int) -> frozenset[int]:
         """The maps pfQuest's zones for a creature lie on, for one the dump spawns nowhere (the
         four dragons of the Emerald Dream are spawned by script): this build's own AreaTable
@@ -928,6 +1020,172 @@ def _zone_name(facts: BossLootInput, map_facts: MapFacts, area_id: int, era_area
     return name if name and name != map_facts.name else ""
 
 
+# ----- where a place is, as words (brief BL13a) ---------------------------------------------------
+
+
+def continent_name(facts: BossLootInput, map_id: int) -> str:
+    """The localised `Map` name of an open world continent (Eastern Kingdoms, Kalimdor), or ""."""
+    found = facts.maps.get(map_id)
+    if map_id not in CONTINENT_MAPS or found is None:
+        return ""
+    return found.name
+
+
+def location_from_ui_map(facts: BossLootInput, map_id: int) -> Location | None:
+    """Source a: the place's own UiMap (a dungeon or an orphan map assigned to its map id), whose
+    parent is a zone map, whose parent is a continent map. None unless exactly one answer."""
+    answers: set[tuple[str, str]] = set()
+    for ui_map, assigned in facts.ui_map_assignments:
+        own = facts.ui_maps.get(ui_map)
+        if assigned != map_id or own is None or own.type not in (UI_MAP_DUNGEON, UI_MAP_ORPHAN):
+            continue
+        zone = facts.ui_maps.get(own.parent)
+        if zone is None or zone.type != UI_MAP_ZONE:
+            continue
+        continent = facts.ui_maps.get(zone.parent)
+        if continent is None or continent.type != UI_MAP_CONTINENT:
+            continue
+        answers.add((zone.name, continent.name))
+    if len(answers) != 1:
+        return None
+    zone_name, continent = answers.pop()
+    return Location(zone_name, continent, WHERE_UI_MAP)
+
+
+def has_entrance(map_facts: MapFacts) -> bool:
+    """Whether the Map row states an entrance position on an open world continent."""
+    return map_facts.corpse_map in CONTINENT_MAPS and (map_facts.corpse_x, map_facts.corpse_y) != (0.0, 0.0)
+
+
+def entrance_zones(map_facts: MapFacts, bounds: Mapping[tuple[int, int], era_mod.MapBounds]) -> list[int]:
+    """Source b's geometry: the zone UiMaps whose corners on the corpse map hold the entrance
+    position (`era_sources.map_bounds`, zone and orphan maps only). The rectangles overlap at
+    the edges, so a position near a border sits inside two or three."""
+    if not has_entrance(map_facts):
+        return []
+    x, y = map_facts.corpse_x, map_facts.corpse_y
+    return sorted(
+        {
+            ui_map
+            for (ui_map, map_id), box in bounds.items()
+            if map_id == map_facts.corpse_map and box.min_x <= x <= box.max_x and box.min_y <= y <= box.max_y
+        }
+    )
+
+
+def zoned_points(era_input: era_mod.EraInput) -> list[tuple[int, float, float, int]]:
+    """(map, world x, world y, zone UiMap) for every pfQuest spawn whose area this build draws on
+    a zone map: pfQuest's percentage turned back into a world position by the zone's own
+    corners (the inverse of era_sources.map_position). Read to break a tie, never shipped. A
+    spawn pfQuest lists in two zones (a copy in another zone within SHARED_SPAWN_YARDS) is
+    left out, both copies."""
+    by_map: dict[int, list[era_mod.MapBounds]] = defaultdict(list)
+    for box in era_input.map_bounds.values():
+        by_map[box.ui_map].append(box)
+    out: list[tuple[int, float, float, int]] = []
+    for creature in sorted(era_input.unit_points):
+        for point in era_input.unit_points[creature]:
+            ui_map = era_input.area_maps.get(point.area, 0)
+            for box in by_map.get(ui_map, ()):
+                wide = box.ui_max_x - box.ui_min_x
+                tall = box.ui_max_y - box.ui_min_y
+                if not wide or not tall:
+                    continue
+                west = (point.x / 100.0 - box.ui_min_x) / wide
+                north = (point.y / 100.0 - box.ui_min_y) / tall
+                out.append(
+                    (
+                        box.map,
+                        box.max_x - north * (box.max_x - box.min_x),
+                        box.max_y - west * (box.max_y - box.min_y),
+                        ui_map,
+                    )
+                )
+    return _unshared(out)
+
+
+def _unshared(points: list[tuple[int, float, float, int]]) -> list[tuple[int, float, float, int]]:
+    reach = SHARED_SPAWN_YARDS
+    grid: dict[tuple[int, int, int], list[tuple[int, float, float, int]]] = defaultdict(list)
+    for point in points:
+        grid[(point[0], int(point[1] // reach), int(point[2] // reach))].append(point)
+
+    def shared(point: tuple[int, float, float, int]) -> bool:
+        map_id, x, y, ui_map = point
+        cx, cy = int(x // reach), int(y // reach)
+        return any(
+            other[3] != ui_map and math.hypot(other[1] - x, other[2] - y) <= reach
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for other in grid.get((map_id, cx + dx, cy + dy), ())
+        )
+
+    return [point for point in points if not shared(point)]
+
+
+def nearest_zone(
+    map_facts: MapFacts,
+    candidates: Collection[int],
+    points: Sequence[tuple[int, float, float, int]],
+    k: int = NEAREST_SPAWNS,
+) -> int:
+    """Source b's tie break: of the candidate zones, the one most of the k pfQuest spawns
+    nearest the entrance lie in (pfQuest states the zone of every spawn), the nearest spawn
+    deciding a tied vote. 0 where no spawn lies in any candidate."""
+    x, y = map_facts.corpse_x, map_facts.corpse_y
+    near = sorted(
+        (math.hypot(px - x, py - y), ui_map)
+        for map_id, px, py, ui_map in points
+        if map_id == map_facts.corpse_map and ui_map in candidates
+    )[:k]
+    if not near:
+        return 0
+    votes: dict[int, int] = defaultdict(int)
+    for _distance, ui_map in near:
+        votes[ui_map] += 1
+    top = max(votes.values())
+    return next(ui_map for _distance, ui_map in near if votes[ui_map] == top)
+
+
+def _top_zone(facts: BossLootInput, area_id: int) -> AreaFacts | None:
+    """The outdoor zone an area lies in: its ParentAreaID chain walked to the top, where the top
+    is an area of an open world continent. None where the chain leaves the table."""
+    area = facts.areas.get(area_id)
+    seen: set[int] = set()
+    while area is not None and area.parent and area.id not in seen:
+        seen.add(area.id)
+        area = facts.areas.get(area.parent)
+    if area is None or area.parent or area.continent not in CONTINENT_MAPS:
+        return None
+    return area
+
+
+def _namesake(place: str, area: str) -> bool:
+    shorter = min(len(normalise(place)), len(normalise(area)))
+    return shorter >= NAMESAKE_MIN_CHARS and names_match(place, area)
+
+
+def zone_from_area(facts: BossLootInput, map_facts: MapFacts, area_id: int) -> AreaFacts | None:
+    """Source c: the outdoor zone the client's AreaTable puts the place in. First the place's own
+    area (`a`, then Map.AreaTableID) where its ParentAreaID leads to a continent's zone; then the
+    outdoor area of the place's name ("Blackfathom Deeps" under Ashenvale, "Not Used Deadmines"
+    under Westfall), which the client keeps beside the instance's own. Only an area with a
+    parent counts, and every one found has to lead to the same zone."""
+    for own in (area_id, map_facts.area):
+        found = facts.areas.get(own)
+        if found is not None and found.parent:
+            top = _top_zone(facts, own)
+            if top is not None:
+                return top
+    tops: dict[int, AreaFacts] = {}
+    for area in sorted(facts.areas.values(), key=lambda a: a.id):
+        if area.continent in CONTINENT_MAPS and area.parent and _namesake(map_facts.name, area.name):
+            top = _top_zone(facts, area.id)
+            if top is not None:
+                tops[top.id] = top
+    return next(iter(tops.values())) if len(tops) == 1 else None
+
+
 def _clamp(level: int | None) -> int | None:
     if level is None or level <= 0:
         return None
@@ -974,7 +1232,11 @@ def derive(
             "hi": _clamp(entry.hi),
             "zones": zones,
         }
-        raw.append((place, [entry], {"lv": "boss" if lv else "", "hi": "boss" if lv else ""}))
+        # A world boss's zones already say where it is: ez stays absent, ec is the continent
+        # they share, from this build's AreaTable (source c).
+        continent = stage.world_boss_continent(zones)
+        where = Location("", continent, WHERE_AREA if continent else WHERE_NONE)
+        raw.append((place, [entry], {"lv": "boss" if lv else "", "hi": "boss" if lv else "", "where": where}))
     for map_id in sorted(maps):
         m = maps[map_id]
         new = map_id not in facts.baseline_maps
@@ -997,6 +1259,7 @@ def derive(
             continue
         lo, hi, lo_from, hi_from = _place_levels(stage, m, entries)
         area = era_input.instance_areas.get(map_id, 0)
+        where = stage.location(m, area)
         place = {
             "name": m.name,
             "k": INSTANCE_KINDS[m.instance_type],
@@ -1009,17 +1272,18 @@ def derive(
             "sz": m.max_players or None,
             "g": 1 if new else None,
         }
-        raw.append((place, entries, {"lv": lo_from, "hi": hi_from}))
+        raw.append((place, entries, {"lv": lo_from, "hi": hi_from, "where": where}))
 
     raw.sort(
         key=lambda item: (band(item[0]["lv"]), item[0]["lv"] or 0, item[0]["k"], item[0]["name"].lower())
     )
 
     strings: set[str] = set()
-    for place, entries, _notes in raw:
+    for place, entries, how in raw:
         strings.add(place["name"])
         if place.get("an"):
             strings.add(place["an"])
+        strings.update(name for name in (how["where"].zone, how["where"].continent) if name)
         strings.update(era_input.areas[zone] for zone in place.get("zones", ()))
         strings.update(entry.name for entry in entries)
     table = sorted(strings)
@@ -1029,6 +1293,7 @@ def derive(
     bosses: list[dict] = []
     notes: list[dict] = []
     for place, entries, how in raw:
+        where: Location = how["where"]
         numbers: list[int] = []
         for entry in entries:
             bosses.append(
@@ -1058,6 +1323,8 @@ def derive(
             "a": place.get("a"),
             "an": index[place["an"]] if place.get("an") else None,
             "z": [index[era_input.areas[zone]] for zone in place["zones"]] if place.get("zones") else None,
+            "ez": index[where.zone] if where.zone else None,
+            "ec": index[where.continent] if where.continent else None,
             "sz": place.get("sz"),
             "g": place.get("g"),
             "b": numbers,
@@ -1075,6 +1342,9 @@ def derive(
                 "hiFrom": how["hi"],
                 "new": bool(place.get("g")),
                 "bosses": len(entries),
+                "zone": where.zone,
+                "continent": where.continent,
+                "whereFrom": where.source,
             }
         )
     bosses = [{key: value for key, value in boss.items() if value is not None} for boss in bosses]
@@ -1098,6 +1368,8 @@ def derive(
         "lootEntries": sum(len(b.get("l", "")) // RECORD_BYTES for b in bosses),
         "worldDropsLeftOut": sum(b.get("w", 0) for b in bosses),
         "strings": len(table),
+        "withZone": sum(1 for p in places if "ez" in p),
+        "withContinent": sum(1 for p in places if "ec" in p),
     }
     return BossLoot(
         strings=table,
@@ -1154,6 +1426,7 @@ def header_lines(table: BossLoot) -> list[str]:
         "p = { n name (index into s), k kind (1 dungeon, 2 raid, 3 world boss), lv the level the "
         f"band is read from (1 to {MAX_PLAYER_LEVEL}), lo/hi the level range, m Map id, a the area "
         "id EraSources uses, an the AreaTable name where it differs from n, z (k=3) the zones, "
+        "ez the entrance zone's name (absent for k=3), ec the continent's name, "
         "sz players, g 1 = new in Forever, b = {indices into b, in draw order} }. Places are in "
         "draw order: band (ceil(lv / 10), no lv last), then lv, then k, then name.",
         "b = { n name, r rank (1 boss, 2 rare elite, 3 rare, 4 chest), lo/hi creature levels, "
@@ -1182,6 +1455,29 @@ def header_lines(table: BossLoot) -> list[str]:
         f"{counts.get('rares', 0)} rares, {counts.get('chests', 0)} chests), "
         f"{counts.get('lootEntries', 0)} loot records.",
     ]
+
+
+def location_lines(table: BossLoot) -> list[str]:
+    """The compile's report of where each place is (brief BL13a): one line per place with the
+    source its ez and ec came from, then the count per source, then the Era instances that did
+    not resolve both, by name."""
+    names = {WHERE_UI_MAP: "a", WHERE_ENTRANCE: "b", WHERE_AREA: "c", WHERE_NONE: "none"}
+    lines: list[str] = []
+    tally: dict[str, int] = defaultdict(int)
+    unresolved: list[str] = []
+    for note in table.notes:
+        source = names[note["whereFrom"]]
+        tally[source] += 1
+        lines.append(
+            f"{source:<4} {note['name']}: {note['zone'] or '-'}, {note['continent'] or '-'}"
+            + (", new" if note["new"] else "")
+        )
+        if note["kind"] != KIND_WORLD_BOSS and not note["new"] and not (note["zone"] and note["continent"]):
+            unresolved.append(note["name"])
+    summary = ", ".join(f"{source} {tally[source]}" for source in ("a", "b", "c", "none"))
+    lines.append(f"by source: {summary}")
+    lines.append(f"Era instances not fully placed: {', '.join(unresolved) if unresolved else 'none'}")
+    return lines
 
 
 # ----- reading the client tables and the credits ------------------------------------------------
@@ -1228,6 +1524,13 @@ def _rows(conn: sqlite3.Connection, build: str, table: str, columns: str) -> lis
     return cursor.fetchall()
 
 
+def _float(value) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _int(value) -> int:
     try:
         return int(value or 0)
@@ -1244,8 +1547,18 @@ def gather_input(conn: sqlite3.Connection, build: str, baseline: str, *, cmangos
             instance_type=_int(row["InstanceType"]),
             max_players=_int(row["MaxPlayers"]),
             area=_int(row["AreaTableID"]),
+            corpse_map=_int(row["CorpseMapID"]),
+            corpse_x=_float(row["Corpse_0"]),
+            corpse_y=_float(row["Corpse_1"]),
+            cosmetic_parent=_int(row["CosmeticParentMapID"]),
         )
-        for row in _rows(conn, build, "Map", "ID, MapName_lang, InstanceType, MaxPlayers, AreaTableID")
+        for row in _rows(
+            conn,
+            build,
+            "Map",
+            "ID, MapName_lang, InstanceType, MaxPlayers, AreaTableID, CorpseMapID, Corpse_0, Corpse_1, "
+            "CosmeticParentMapID",
+        )
     }
     baseline_maps = frozenset(_int(row["ID"]) for row in _rows(conn, baseline, "Map", "ID"))
     encounters = [
@@ -1298,6 +1611,23 @@ def gather_input(conn: sqlite3.Connection, build: str, baseline: str, *, cmangos
             conn, build, "AreaTable", "ID, AreaName_lang, ContinentID, ParentAreaID, ContentTuningID"
         )
     }
+    ui_maps = {
+        _int(row["ID"]): UiMapFacts(
+            id=_int(row["ID"]),
+            name=str(row["Name_lang"] or ""),
+            parent=_int(row["ParentUiMapID"]),
+            type=_int(row["Type"]),
+        )
+        for row in _rows(conn, build, "UiMap", "ID, Name_lang, ParentUiMapID, Type")
+    }
+    ui_map_assignments = tuple(
+        sorted(
+            {
+                (_int(row["UiMapID"]), _int(row["MapID"]))
+                for row in _rows(conn, build, "UiMapAssignment", "UiMapID, MapID")
+            }
+        )
+    )
     for name, found in (("Map", maps), ("DungeonEncounter", encounters)):
         if not found:
             raise BossLootError(
@@ -1313,4 +1643,6 @@ def gather_input(conn: sqlite3.Connection, build: str, baseline: str, *, cmangos
         tuning=tuning,
         areas=areas,
         credits=read_credits(cmangos_path),
+        ui_maps=ui_maps,
+        ui_map_assignments=ui_map_assignments,
     )
