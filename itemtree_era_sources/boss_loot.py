@@ -38,6 +38,7 @@ compiler is mirrored beside era_sources.py into the public repository.
 from __future__ import annotations
 
 import gzip
+import json
 import math
 import re
 import sqlite3
@@ -47,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from itemtree_data import creaturecache as cache_mod
 from itemtree_data import era_sources as era_mod
 
 # ----- the contract's constants -------------------------------------------------------------
@@ -456,6 +458,18 @@ class Location:
     source: str = WHERE_NONE
 
 
+@dataclass(frozen=True)
+class NewBossRow:
+    """One row of curated/new_bosses.json that passed its checks: a community named creature
+    for an encounter new in Forever, with the pages it rests on."""
+
+    encounter: int
+    name: str
+    creature: int
+    display: int = 0
+    sources: tuple[tuple[str, str], ...] = ()
+
+
 @dataclass
 class BossLootInput:
     """Everything the stage reads from the client builds, beside the EraInput it shares with
@@ -473,6 +487,18 @@ class BossLootInput:
     # UiMapAssignment row, which is what ties a UiMap to the map it draws.
     ui_maps: dict[int, UiMapFacts] = field(default_factory=dict)
     ui_map_assignments: tuple[tuple[int, int], ...] = ()
+    # The client's creature cache (brief BL15a): every creature a player has seen, merged from
+    # the client's own file and the testers' files, and how many files were read.
+    cached_creatures: dict[int, cache_mod.CachedCreature] = field(default_factory=dict)
+    cache_files: int = 0
+    # The build's own encounter models, where a table states them: encounter id -> (display id,
+    # creature id or 0), and the source that answered ("" for none).
+    client_models: dict[int, tuple[int, int]] = field(default_factory=dict)
+    client_source: str = ""
+    # curated/new_bosses.json, the rows that passed: encounter id -> the row.
+    curated_bosses: dict[int, NewBossRow] = field(default_factory=dict)
+    # Every cache file left out, cache disagreement and curated row refused, for the summary.
+    notes: list[str] = field(default_factory=list)
 
 
 class ItemFacts(Protocol):
@@ -633,6 +659,14 @@ class _Stage:
         self.scaffolding: set[tuple[str, int]] = set()
         # pfQuest's zoned spawns as world positions, built the first time a tie needs them.
         self.points: list[tuple[int, float, float, int]] | None = None
+        # The creatures the cache or the curated file gave a new encounter, and how many each.
+        self.cache_used: set[int] = set()
+        self.named: dict[str, int] = {
+            "namedByClient": 0,
+            "modelsByClient": 0,
+            "namedByCache": 0,
+            "namedByCurated": 0,
+        }
 
     # ----- items ---------------------------------------------------------------------------
 
@@ -711,6 +745,70 @@ class _Stage:
             entry.creature_type = facts[0].creature_type
         return entry
 
+    def cached_display(self, cid: int) -> int:
+        """The first display id the client cached for the creature that this build carries."""
+        found = self.facts.cached_creatures.get(cid)
+        for display in found.displays if found else ():
+            if display > 0 and display in self.era.display_ids:
+                return display
+        return 0
+
+    def cached_named(self, name: str) -> cache_mod.CachedCreature | None:
+        """The cached creature an encounter names: exactly, then case folded; the lowest entry
+        id where several share the name. A creature the dump knows, or one already taken, is
+        never offered: the index already has it."""
+        offered = [
+            c
+            for cid, c in sorted(self.facts.cached_creatures.items())
+            if cid not in self.era.creatures and cid not in self.cache_used
+        ]
+        for same in (lambda c: c.name == name, lambda c: c.name.casefold() == name.casefold()):
+            for creature in offered:
+                if same(creature):
+                    return creature
+        return None
+
+    def name_new_boss(self, entry: _Entry) -> None:
+        """c, cd and ct for an encounter new in Forever that nothing else named: the build's own
+        encounter models first (cd, and c where the table gives a creature), then the client's
+        creature cache, then curated/new_bosses.json. The entry stays new (g = 1)."""
+        display, creature = self.facts.client_models.get(entry.encounter, (0, 0))
+        display = display if display in self.era.display_ids else 0
+        if creature > 0 and creature not in self.era.creatures and creature not in self.cache_used:
+            self.cache_used.add(creature)
+            entry.creatures = (creature,)
+            seen = self.facts.cached_creatures.get(creature)
+            entry.creature_type = seen.creature_type if seen else 0
+            entry.display = display or self.cached_display(creature)
+            self.named["namedByClient"] += 1
+            return
+        if display:
+            self.named["modelsByClient"] += 1
+        self._name_from_cache_or_curated(entry)
+        if display:
+            entry.display = display
+
+    def _name_from_cache_or_curated(self, entry: _Entry) -> None:
+        cached = self.cached_named(entry.name)
+        if cached is not None:
+            self.cache_used.add(cached.id)
+            entry.creatures = (cached.id,)
+            entry.display = self.cached_display(cached.id)
+            entry.creature_type = cached.creature_type
+            self.named["namedByCache"] += 1
+            return
+        row = self.facts.curated_bosses.get(entry.encounter)
+        if row is None or row.creature in self.era.creatures or row.creature in self.cache_used:
+            return
+        self.cache_used.add(row.creature)
+        entry.creatures = (row.creature,)
+        entry.display = self.cached_display(row.creature)
+        if not entry.display and row.display in self.era.display_ids:
+            entry.display = row.display
+        seen = self.facts.cached_creatures.get(row.creature)
+        entry.creature_type = seen.creature_type if seen else 0
+        self.named["namedByCurated"] += 1
+
     def lives_on(self, cid: int, map_id: int) -> bool:
         """Whether every always there spawn of the creature is on this one map."""
         return self.maps.get(cid) == frozenset({map_id})
@@ -779,9 +877,10 @@ class _Stage:
         for encounter in kept:
             creatures = found[encounter.id]
             new = encounter.id not in self.facts.baseline_encounters and not creatures
-            entries.append(
-                self.creature_entry(encounter.name, RANK_BOSS, creatures, encounter=encounter.id, new=new)
-            )
+            entry = self.creature_entry(encounter.name, RANK_BOSS, creatures, encounter=encounter.id, new=new)
+            if new:
+                self.name_new_boss(entry)
+            entries.append(entry)
 
         # The creatures CMaNGOS credits for an encounter kill that no kept encounter took, where
         # they live only here (Gnomeregan: this build lists its encounters under Season of
@@ -976,8 +1075,9 @@ def _place_levels(
         found = tuning.levels() if tuning is not None else None
         if found is not None:
             candidates.append(("area", found))
-    levelled = [e for e in entries if e.creatures and e.rank == RANK_BOSS] or [
-        e for e in entries if e.creatures
+    # A new encounter the creature cache or the curated file named has no level: left out.
+    levelled = [e for e in entries if e.creatures and not e.new and e.rank == RANK_BOSS] or [
+        e for e in entries if e.creatures and not e.new
     ]
     if levelled:
         candidates.append(("bosses", (min(e.lo for e in levelled), max(e.hi for e in levelled))))
@@ -1370,6 +1470,8 @@ def derive(
         "strings": len(table),
         "withZone": sum(1 for p in places if "ez" in p),
         "withContinent": sum(1 for p in places if "ec" in p),
+        "cacheFiles": facts.cache_files,
+        **stage.named,
     }
     return BossLoot(
         strings=table,
@@ -1538,8 +1640,145 @@ def _int(value) -> int:
         return 0
 
 
-def gather_input(conn: sqlite3.Connection, build: str, baseline: str, *, cmangos_path: Path) -> BossLootInput:
-    """Read the client tables of both builds and the credits. Everything here is I/O."""
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """The loaded table's columns; empty where the table is not loaded at all."""
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def client_encounter_models(conn: sqlite3.Connection, build: str) -> tuple[str, dict[int, tuple[int, int]]]:
+    """(the source that answered, encounter id -> (display id, creature id or 0)) from the
+    build's own tables, where it has them: a CreatureDisplayID column on DungeonEncounter (retail
+    has one), else an encounter journal (JournalEncounter.DungeonEncounterID joined to
+    JournalEncounterCreature, the first creature of each by OrderIndex, with CreatureID where the
+    table has that column). ("", {}) where neither holds a row for this build. A lookup of what
+    is loaded only; nothing is fetched."""
+    found: dict[int, tuple[int, int]] = {}
+    if "CreatureDisplayID" in _columns(conn, "DungeonEncounter"):
+        for row in conn.execute(
+            "SELECT ID, CreatureDisplayID FROM DungeonEncounter WHERE build_id = ?", (build,)
+        ):
+            if _int(row[1]) > 0:
+                found[_int(row[0])] = (_int(row[1]), 0)
+        if found:
+            return "DungeonEncounter.CreatureDisplayID", found
+    journal, creatures = _columns(conn, "JournalEncounter"), _columns(conn, "JournalEncounterCreature")
+    if {"ID", "DungeonEncounterID"} <= journal and {
+        "JournalEncounterID",
+        "CreatureDisplayInfoID",
+    } <= creatures:
+        creature = "c.CreatureID" if "CreatureID" in creatures else "0"
+        order = "c.OrderIndex, c.ID" if "OrderIndex" in creatures else "c.ID"
+        rows = conn.execute(
+            f"SELECT j.DungeonEncounterID, c.CreatureDisplayInfoID, {creature} "
+            "FROM JournalEncounterCreature c JOIN JournalEncounter j "
+            "ON j.ID = c.JournalEncounterID AND j.build_id = c.build_id "
+            f"WHERE c.build_id = ? ORDER BY j.DungeonEncounterID, {order}",
+            (build,),
+        )
+        for row in rows:
+            encounter = _int(row[0])
+            if encounter > 0 and encounter not in found and (_int(row[1]) > 0 or _int(row[2]) > 0):
+                found[encounter] = (_int(row[1]), _int(row[2]))
+        if found:
+            return "JournalEncounterCreature", found
+    return "", {}
+
+
+NEW_BOSSES_PROVENANCE = "community"
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def load_new_bosses(path: Path) -> dict:
+    """curated/new_bosses.json as read. A file that cannot be read at all fails."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BossLootError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise BossLootError(f"{path} is not a JSON object")
+    return raw
+
+
+def _positive(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate_new_bosses(
+    raw: dict, encounters: Sequence[EncounterFacts], baseline_encounters: Collection[int]
+) -> tuple[dict[int, NewBossRow], list[str]]:
+    """The rows that pass, by encounter id, and a note for each row refused. A row names an
+    encounter of this build that the baseline does not have, by its own name, a creature id,
+    an optional display id, provenance "community" and at least one {url, date} source."""
+    by_id = {e.id: e for e in encounters}
+    rows: dict[int, NewBossRow] = {}
+    refused: list[str] = []
+    for row in raw.get("encounters") or []:
+        if not isinstance(row, dict):
+            refused.append("new bosses: a row is not an object")
+            continue
+        encounter_id = row.get("encounterId")
+        what = f"new bosses: encounter {encounter_id!r}"
+        encounter = by_id.get(encounter_id) if _positive(encounter_id) else None
+        if encounter is None:
+            refused.append(f"{what}: not a DungeonEncounter row of this build")
+            continue
+        if encounter.id in baseline_encounters:
+            refused.append(f"{what}: the baseline has it, so it is not new")
+            continue
+        if encounter.id in rows:
+            refused.append(f"{what}: repeated")
+            continue
+        if row.get("name") != encounter.name:
+            refused.append(f"{what}: the build names it {encounter.name!r}, the file {row.get('name')!r}")
+            continue
+        if not _positive(row.get("creatureId")):
+            refused.append(f"{what}: no creatureId")
+            continue
+        display = row.get("displayId", 0)
+        if display != 0 and not _positive(display):
+            refused.append(f"{what}: displayId is not a positive id")
+            continue
+        if row.get("provenance") != NEW_BOSSES_PROVENANCE:
+            refused.append(f"{what}: provenance must be {NEW_BOSSES_PROVENANCE!r}")
+            continue
+        sources = row.get("sources")
+        good = (
+            isinstance(sources, list)
+            and bool(sources)
+            and all(
+                isinstance(source, dict)
+                and isinstance(source.get("url"), str)
+                and source["url"].startswith("https://")
+                and isinstance(source.get("date"), str)
+                and _DATE.match(source["date"])
+                for source in sources
+            )
+        )
+        if not good:
+            refused.append(f"{what}: every source needs an https url and a YYYY-MM-DD date")
+            continue
+        rows[encounter.id] = NewBossRow(
+            encounter=encounter.id,
+            name=encounter.name,
+            creature=row["creatureId"],
+            display=display,
+            sources=tuple((source["url"], source["date"]) for source in sources),
+        )
+    return rows, refused
+
+
+def gather_input(
+    conn: sqlite3.Connection,
+    build: str,
+    baseline: str,
+    *,
+    cmangos_path: Path,
+    creature_caches: Sequence[Path] = (),
+    new_bosses_path: Path | None = None,
+) -> BossLootInput:
+    """Read the client tables of both builds and the credits. Everything here is I/O.
+    `creature_caches` are the creaturecache.wdb files to read (the client's own first), and
+    `new_bosses_path` is curated/new_bosses.json where it is there."""
     maps = {
         _int(row["ID"]): MapFacts(
             id=_int(row["ID"]),
@@ -1634,6 +1873,21 @@ def gather_input(conn: sqlite3.Connection, build: str, baseline: str, *, cmangos
                 f"build {build} has no {name} rows; run `itemtree-data fetch {build} -t {name}` "
                 f"then `itemtree-data load {build} -t {name}`"
             )
+    notes: list[str] = []
+    client_source, client_models = client_encounter_models(conn, build)
+    notes.append(
+        f"client encounter models from {client_source} ({len(client_models)} encounters)"
+        if client_source
+        else "no client encounter models on this build"
+    )
+    merged = cache_mod.read_many(list(creature_caches), build=build)
+    notes.extend(merged.notes)
+    curated: dict[int, NewBossRow] = {}
+    if new_bosses_path is not None and new_bosses_path.is_file():
+        curated, refused = validate_new_bosses(
+            load_new_bosses(new_bosses_path), encounters, baseline_encounters
+        )
+        notes.extend(refused)
     return BossLootInput(
         maps=maps,
         baseline_maps=baseline_maps,
@@ -1645,4 +1899,10 @@ def gather_input(conn: sqlite3.Connection, build: str, baseline: str, *, cmangos
         credits=read_credits(cmangos_path),
         ui_maps=ui_maps,
         ui_map_assignments=ui_map_assignments,
+        client_models=client_models,
+        client_source=client_source,
+        cached_creatures=merged.creatures,
+        cache_files=len(merged.files_read),
+        curated_bosses=curated,
+        notes=notes,
     )
