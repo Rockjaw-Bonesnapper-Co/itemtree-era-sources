@@ -23,7 +23,16 @@ summarised group, a limited stock vendor's stock count, the container item's own
 2026-09-20 a handful of **map pins** per creature name per area, and since 2026-09-27 per herb,
 vein, fishing pool and chest name per area too, and since brief N3 which creature starts and which
 ends each quest, by the creature's name. No prose of any kind: not the
-loot rows' `comments`, not quest text, not `SubName`, not gossip, not scripts.
+loot rows' `comments`, not quest text, not gossip, not scripts.
+
+Since 2026-09-27 (brief T1, on the owner's ruling of 2026-09-27) two more columns of
+`creature_template` are read, for the vendors and the quest givers and enders the table already
+names and no other creature: `SubName`, the short title under a name such as "Cooking Supplies",
+which is a title and not prose, shipped in `st` so a vendor row can say where to look; and
+`Faction`, a FactionTemplate id, reduced through THIS build's own `FactionTemplate` and `Faction`
+tables to one number (1 Alliance, 2 Horde, 3 both) and shipped in `cf`, so a recipe whose only
+vendor is Alliance can say so. Every recipe vendor is a vendor the table names, so the recipe
+sources are covered by the same rule. Nothing else about a faction is shipped.
 
 The pins are the one reversal of an old rule, and they are narrow. Until 2026-09-20 this module
 stored no coordinate at all. It now reduces each creature's spawns, per zone, to at most six
@@ -165,8 +174,10 @@ RETIRED_INPUTS: tuple[str, ...] = ()
 CREDIT = (
     "Historical Classic Era source data, derived from the CMaNGOS Classic content database "
     "(github.com/cmangos/classic-db), which the MaNGOS community compiled for World of "
-    "Warcraft patch 1.12. Drop chances are that database's own loot table figures. Map pins "
-    "are reduced from that database's own spawn positions. Creature and object zones come "
+    "Warcraft patch 1.12. Creature, object and quest names, vendor and quest giver titles and "
+    "their factions (reduced to Alliance, Horde or both through the client's own faction "
+    "tables) are that database's own. Drop chances are that database's own loot table "
+    "figures. Map pins are reduced from that database's own spawn positions. Creature and object zones come "
     "from pfQuest's vanilla database (github.com/shagu/pfQuest), which contributes the area "
     "id and nothing else. WoW Forever may differ; the addon shows these as predicted."
 )
@@ -176,7 +187,8 @@ CREDIT = (
 # data is Blizzard's, and neither claims ItemTree's own licence covers the upstream database.
 LICENCE_NOTE_FACTS = (
     "This module is a facts only derivation: ids, numbers, the names of creatures, objects "
-    "and places, and a handful of reduced map points, re-expressed by the pipeline. No prose, "
+    "and places, vendor and quest giver titles and factions, and a handful of reduced map "
+    "points, re-expressed by the pipeline. No prose, "
     "no descriptions, no quest text and no comments are taken from the source database, and "
     "none of its own text is reproduced here."
 )
@@ -547,7 +559,13 @@ class LootEntry:
 class CreatureFacts:
     """What `creature_template` states about one creature, stripped to facts.
 
-    `SubName`, every script column and every piece of text but the name are never read.
+    Every script column and every piece of text but the name and the `SubName` are never read.
+    `subname` is `SubName`, the short title under a name ("Cooking Supplies"), read since
+    2026-09-27 on the owner's ruling of that day and shipped in `st` for vendors and quest
+    givers and enders only. `faction` is the `Faction` column, a FactionTemplate id, read on the
+    same ruling and shipped in `cf` only as the side it resolves to through this build's own
+    FactionTemplate and Faction tables (the pinned dump states one `Faction` column, not the
+    later `FactionAlliance` and `FactionHorde` pair, and the reader takes whichever it finds).
     `creature_type` is `CreatureType` (1 beast, 2 dragonkin, and so on) and `family` is the
     beast `Family`, both plain ids: what KIND of thing a name is, so the interface can draw a
     spider differently from a murloc.
@@ -570,6 +588,8 @@ class CreatureFacts:
     skinning: int = 0
     pickpocket: int = 0
     vendor_template: int = 0
+    subname: str = ""
+    faction: int = 0
 
 
 @dataclass(frozen=True)
@@ -766,6 +786,10 @@ class EraInput:
     quest_starts: list[tuple[int, int]] = field(default_factory=list)
     quest_ends: list[tuple[int, int]] = field(default_factory=list)
     quest_names: dict[int, str] = field(default_factory=dict)
+    # Brief T1: FactionTemplate id -> the side it resolves to (FACTION_ALLIANCE, FACTION_HORDE or
+    # FACTION_BOTH), from THIS build's own FactionTemplate and Faction tables by faction_sides.
+    # A template this build does not carry has no entry, and a creature on it gets no `cf`.
+    faction_sides: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -801,6 +825,10 @@ class EraSources:
     # Brief N3: a creature or vendor name's index into `s` -> (the quests it starts, the quests it
     # ends), each a string packed by pack_quests, "" where it has none of that side.
     quest_givers: dict[int, tuple[str, str]] = field(default_factory=dict)
+    # Brief T1: a vendor or quest giver NAME's index into `s` -> its SubName's index into `s`.
+    subnames: dict[int, int] = field(default_factory=dict)
+    # Brief T1: a vendor or quest giver NAME's index into `s` -> 1 Alliance, 2 Horde, 3 both.
+    factions: dict[int, int] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
 
@@ -823,6 +851,8 @@ class EraSources:
             "ok": dict(self.object_kinds),
             "qg": {index: list(pair) for index, pair in self.quest_givers.items()},
             "zm": dict(self.area_maps),
+            "st": dict(self.subnames),
+            "cf": dict(self.factions),
             "x": dict(self.list_index),
             "xl": list(self.lists),
         }
@@ -1215,6 +1245,12 @@ def _absorb(
             skinning=_int(col("SkinningLootId")),
             pickpocket=_int(col("PickpocketLootId")),
             vendor_template=_int(col("VendorTemplateId")),
+            # Brief T1, the owner's ruling of 2026-09-27: the title under the name and the
+            # faction template id. The pinned dump states one `Faction` column; a later dump's
+            # `FactionAlliance` is the same template for the side that matters first.
+            # An unquoted NULL is how the dump leaves a SubName out, on nearly every creature.
+            subname="" if col("SubName") in (None, "NULL") else (col("SubName") or "").strip(),
+            faction=_int(col("Faction") if col("Faction") is not None else col("FactionAlliance")),
         )
         return
     if table == "gameobject_template":
@@ -1602,6 +1638,115 @@ def instance_areas(conn: sqlite3.Connection, build: str, areas: Mapping[int, str
         if len(found) == 1:
             out[map_id] = found[0]
     return dict(sorted(out.items()))
+
+
+# ----- the side a creature is on (brief T1) ----------------------------------------------------
+#
+# The owner's ruling of 2026-09-27: a creature's `Faction` (a FactionTemplate id) may be read, and
+# what ships is one number per name, the side the template resolves to through THIS build's own
+# FactionTemplate and Faction tables. The template's own group bits say it first: a template that
+# is a member of or friendly to exactly one of the two player groups is that side's, and one
+# friendly to every player (the player group bit in FriendGroup) or to both is both. A template
+# friendly to neither is read by what it is hostile to: hostile to exactly one side makes it the
+# other side's, hostile to both makes it both. Only then does the Faction tree decide, by the root
+# its faction hangs from (469 Alliance, 67 Horde). Anything else, which is every neutral vendor
+# (Booty Bay, Gadgetzan, the Argent Dawn), is both.
+
+FACTION_GROUP_PLAYER = 0x1
+FACTION_GROUP_ALLIANCE = 0x2
+FACTION_GROUP_HORDE = 0x4
+FACTION_ROOT_ALLIANCE = 469
+FACTION_ROOT_HORDE = 67
+# A Faction parent chain longer than this is a loop in the data, and is read as no root at all.
+FACTION_DEPTH = 16
+FACTION_TEMPLATE_SLOTS = 8
+
+
+@dataclass(frozen=True)
+class FactionTemplateFacts:
+    """One `FactionTemplate` row: the faction it belongs to, its three group masks and the
+    factions it lists as friends and as enemies by id."""
+
+    id: int
+    faction: int = 0
+    group: int = 0
+    friend_group: int = 0
+    enemy_group: int = 0
+    friends: tuple[int, ...] = ()
+    enemies: tuple[int, ...] = ()
+
+
+def faction_root(faction: int, parents: Mapping[int, int]) -> int:
+    """The top of a faction's `ParentFactionID` chain, or 0 for a loop."""
+    current = faction
+    for _step in range(FACTION_DEPTH):
+        parent = parents.get(current, 0)
+        if not parent:
+            return current
+        current = parent
+    return 0
+
+
+def template_side(template: FactionTemplateFacts, parents: Mapping[int, int]) -> int:
+    """The side one faction template is on: FACTION_ALLIANCE, FACTION_HORDE or FACTION_BOTH."""
+    if template.friend_group & FACTION_GROUP_PLAYER:
+        return FACTION_BOTH
+    roots_friend = {faction_root(f, parents) for f in template.friends if f}
+    roots_enemy = {faction_root(f, parents) for f in template.enemies if f}
+    member = template.group | template.friend_group
+    alliance = bool(member & FACTION_GROUP_ALLIANCE) or FACTION_ROOT_ALLIANCE in roots_friend
+    horde = bool(member & FACTION_GROUP_HORDE) or FACTION_ROOT_HORDE in roots_friend
+    if alliance != horde:
+        return FACTION_ALLIANCE if alliance else FACTION_HORDE
+    if alliance:
+        return FACTION_BOTH
+    enemy = template.enemy_group
+    hostile_alliance = bool(enemy & FACTION_GROUP_ALLIANCE) or FACTION_ROOT_ALLIANCE in roots_enemy
+    hostile_horde = bool(enemy & FACTION_GROUP_HORDE) or FACTION_ROOT_HORDE in roots_enemy
+    if hostile_alliance != hostile_horde:
+        return FACTION_HORDE if hostile_alliance else FACTION_ALLIANCE
+    if hostile_alliance:
+        return FACTION_BOTH
+    root = faction_root(template.faction, parents)
+    if root == FACTION_ROOT_ALLIANCE:
+        return FACTION_ALLIANCE
+    if root == FACTION_ROOT_HORDE:
+        return FACTION_HORDE
+    return FACTION_BOTH
+
+
+def faction_sides(templates: Sequence[FactionTemplateFacts], parents: Mapping[int, int]) -> dict[int, int]:
+    """FactionTemplate id -> its side, for every template given."""
+    ordered = sorted(templates, key=lambda template: template.id)
+    return {template.id: template_side(template, parents) for template in ordered}
+
+
+def read_faction_sides(conn: sqlite3.Connection, build: str) -> dict[int, int]:
+    """FactionTemplate id -> its side, from THIS build's own FactionTemplate and Faction tables.
+
+    Read for the ids, the group masks, the friend and enemy lists and the parent ids. No faction
+    name, no reputation figure and nothing else out of either table is read or shipped.
+    """
+
+    def number(row: sqlite3.Row, column: str) -> int:
+        return int(row[column] or 0) if column in row.keys() else 0
+
+    templates = [
+        FactionTemplateFacts(
+            id=number(row, "ID"),
+            faction=number(row, "Faction"),
+            group=number(row, "FactionGroup"),
+            friend_group=number(row, "FriendGroup"),
+            enemy_group=number(row, "EnemyGroup"),
+            friends=tuple(number(row, f"Friend_{slot}") for slot in range(FACTION_TEMPLATE_SLOTS)),
+            enemies=tuple(number(row, f"Enemies_{slot}") for slot in range(FACTION_TEMPLATE_SLOTS)),
+        )
+        for row in _map_table(conn, build, "FactionTemplate", "*")
+    ]
+    parents = {
+        number(row, "ID"): number(row, "ParentFactionID") for row in _map_table(conn, build, "Faction", "*")
+    }
+    return faction_sides(templates, parents)
 
 
 _QUEST_BLOCK = re.compile(r"^  \[(\d+)\] = \{", re.MULTILINE)
@@ -2385,7 +2530,9 @@ def _creature_kinds(
     Family among the creatures of that type wins with it, and the level band is the widest of
     all of them: a name that covers levels 11 to 14 and 36 to 40 covers 11 to 40.
 
-    Ids and numbers only. `SubName` is never read, here or anywhere.
+    Ids and numbers only. `SubName` is not read here. Since 2026-09-27, on the owner's ruling of
+    that day, it is read for vendors and quest givers alone and ships in `st`: see
+    _titles_and_sides.
     """
     by_name: dict[str, list[CreatureFacts]] = defaultdict(list)
     for creature_id in sorted(era_input.creatures):
@@ -2896,6 +3043,65 @@ def _quest_givers(
     return out
 
 
+def _vendor_creatures(era_input: EraInput) -> set[int]:
+    """Every creature id that sells anything, by `npc_vendor` or by a vendor template."""
+    found = {offer.vendor for offer in era_input.vendor_offers}
+    found.update(cid for cid, facts in era_input.creatures.items() if facts.vendor_template)
+    return found
+
+
+def _titles_and_sides(
+    era_input: EraInput,
+    names: set[str],
+    strings: _Strings,
+    counts: dict[str, int],
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Brief T1: a vendor or quest giver NAME's index into `s` -> (its SubName's index into `s`,
+    its side), for the names given and no other.
+
+    Keyed by the name, the way `ck` and `qg` are. Where creatures share a name, the ones that sell
+    something speak for it if any of them does (so "Innkeeper Farley" the vendor is not titled by
+    a quest giver of the same name), and among those the commonest non empty SubName wins, ties by
+    the lowest creature id. The side is the one every such creature's template agrees on, and 3
+    (both) where they disagree; a creature on a template this build does not carry says nothing,
+    and a name none of whose creatures can be read has no `cf` entry at all.
+    """
+    sellers = _vendor_creatures(era_input)
+    by_name: dict[str, list[CreatureFacts]] = defaultdict(list)
+    for creature_id in sorted(era_input.creatures):
+        facts = era_input.creatures[creature_id]
+        if facts.name in names:
+            by_name[facts.name].append(facts)
+    subnames: dict[int, int] = {}
+    sides: dict[int, int] = {}
+    conflicts = 0
+    for name in sorted(by_name):
+        creatures = by_name[name]
+        speaking = [facts for facts in creatures if facts.id in sellers] or creatures
+        titles = Counter(facts.subname for facts in speaking if facts.subname)
+        if titles:
+            first = {}
+            for facts in speaking:
+                first.setdefault(facts.subname, facts.id)
+            title = min(titles, key=lambda value: (-titles[value], first[value]))
+            if len(titles) > 1:
+                conflicts += 1
+            subnames[strings.add(name)] = strings.add(title)
+        found = {
+            era_input.faction_sides[facts.faction]
+            for facts in speaking
+            if facts.faction in era_input.faction_sides
+        }
+        if found:
+            sides[strings.add(name)] = found.pop() if len(found) == 1 else FACTION_BOTH
+    counts["subnames"] = len(subnames)
+    counts["subnameConflicts"] = conflicts
+    counts["factions"] = len(sides)
+    for side, label in ((FACTION_ALLIANCE, "Alliance"), (FACTION_HORDE, "Horde"), (FACTION_BOTH, "Both")):
+        counts[f"factions{label}"] = sum(1 for value in sides.values() if value == side)
+    return subnames, sides
+
+
 def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] = ()) -> EraSources:
     """Turn the two pinned databases into the table the addon ships, counting every refusal.
 
@@ -3013,6 +3219,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
                 quest_titles[quest] = strings.add(era_input.quest_names[quest])
                 added += 1
     counts["questGiverTitlesAdded"] = added
+    # Brief T1, the owner's ruling of 2026-09-27: the title under the name and the side, for the
+    # vendors and the quest givers and enders the table names, and no other creature. Every
+    # recipe's vendor is one of those vendors, so "Alliance only" on a recipe needs nothing more.
+    titled_names = vendor_names | {strings.value(index) for index in givers}
+    subnames, sides = _titles_and_sides(era_input, titled_names, strings, counts)
     # The pins go last, because a pin's own area is an area the player can now read and so has to
     # reach `z` and `s` before the string table is sorted.
     pins = _creature_pins(era_input, npc_names, strings, used_areas, counts, dropped)
@@ -3048,6 +3259,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     areas_out = {area: remap[index] for area, index in sorted(used_areas.items())}
     quest_titles = {quest: remap[index] for quest, index in sorted(quest_titles.items())}
     kinds = {remap[index]: packed for index, packed in kinds.items()}
+    subnames = {remap[index]: remap[title] for index, title in subnames.items()}
+    sides = {remap[index]: side for index, side in sides.items()}
     displays = {remap[index]: display for index, display in displays.items()}
     givers_out = {
         remap[index]: (pack_quests(starts), pack_quests(ends)) for index, (starts, ends) in givers.items()
@@ -3136,6 +3349,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         object_kinds=dict(sorted(object_kinds_out.items())),
         area_maps=area_maps_out,
         quest_givers=dict(sorted(givers_out.items())),
+        subnames=dict(sorted(subnames.items())),
+        factions=dict(sorted(sides.items())),
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -3163,7 +3378,8 @@ def header_lines(table: EraSources) -> list[str]:
         "cd = { [string index] = creature display id }, "
         "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
         "ok = { [string index] = object category }, qg = { [string index] = { starts, ends } }, "
-        "zm = { [areaId] = uiMapId }, "
+        "zm = { [areaId] = uiMapId }, st = { [string index] = string index }, "
+        "cf = { [string index] = side }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
         "g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
@@ -3245,7 +3461,15 @@ def header_lines(table: EraSources) -> list[str]:
         "zm: the zone level UiMap id THIS build draws an area on, for every area z names that "
         "resolves to one. Absent means this build has no map for that area, which is every "
         "instance root area: this build ships no dungeon map at all, so a creature inside one "
-        "has no pin and no map and the addon says so rather than guessing an entrance.",
+        "has no pin and no map and the addon says so rather than guessing an entrance. "
+        "st: the title under a vendor's or a quest giver's NAME (creature_template.SubName, "
+        "such as Cooking Supplies), as an index into s, keyed the way ck is. Present only for the "
+        "vendor names c=4 rows and lists use and the names qg carries, and only where the source "
+        "states one. Where creatures share a name, a vendor's title wins, then the commonest. "
+        "cf: the side a vendor's or a quest giver's NAME is on, keyed the way st is: 1 Alliance, 2 "
+        "Horde, 3 both, from creature_template.Faction through THIS build's own FactionTemplate "
+        "and Faction tables. Neutral (Booty Bay, Gadgetzan) is 3. Where creatures of one name "
+        "disagree, 3. Absent means the build could not say.",
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "
         "searched. x[itemId][c] is a 1 based number into xl, and xl holds each distinct list "
         "once. A list is a run of fixed width records of base 91 digits (the bytes 35 to 126 "
@@ -3272,7 +3496,9 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('questGiverStarts', 0)}, ends {counts.get('questGiverEnds', 0)}), and "
         f"{counts.get('listEntries', 0)} further sources in "
         f"{counts.get('listsShipped', 0)} lists, stored as {counts.get('listsStored', 0)} "
-        "distinct packed strings.",
+        f"distinct packed strings; {counts.get('subnames', 0)} titles in st and "
+        f"{counts.get('factions', 0)} sides in cf (Alliance {counts.get('factionsAlliance', 0)}, "
+        f"Horde {counts.get('factionsHorde', 0)}, both {counts.get('factionsBoth', 0)}).",
         f"{counts.get('pins', 0)} map pins in mp over {counts.get('pinNames', 0)} names and "
         f"{counts.get('pinGroups', 0)} name and area groups, standing for "
         f"{counts.get('pinSpawnsPlaced', 0)} spawns; {counts.get('objectPins', 0)} object map pins "
@@ -3317,5 +3543,6 @@ def gather_input(
     era_input.area_maps = area_maps(conn, build, era_input.areas)
     era_input.map_bounds = map_bounds(conn, build)
     era_input.instance_areas = instance_areas(conn, build, era_input.areas)
+    era_input.faction_sides = read_faction_sides(conn, build)
     era_input.curated_quests = read_curated_quests(curated_quests_path)
     return era_input
