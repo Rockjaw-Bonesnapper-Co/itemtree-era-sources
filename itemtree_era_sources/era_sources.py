@@ -21,7 +21,8 @@ NAME, the creature and object **id**, the creature's display id, the Blizzard ar
 quest id and the faction its race mask implies, the drop chance, the level band of a
 summarised group, a limited stock vendor's stock count, the container item's own id, and since
 2026-09-20 a handful of **map pins** per creature name per area, and since 2026-09-27 per herb,
-vein, fishing pool and chest name per area too. No prose of any kind: not the
+vein, fishing pool and chest name per area too, and since brief N3 which creature starts and which
+ends each quest, by the creature's name. No prose of any kind: not the
 loot rows' `comments`, not quest text, not `SubName`, not gossip, not scripts.
 
 The pins are the one reversal of an old rule, and they are narrow. Until 2026-09-20 this module
@@ -395,6 +396,18 @@ KIND_FAMILY_SPAN = 64  # the beast Family, 0 to 63 (this database uses 0 to 27)
 # The categories whose `n` is a creature, which are the ones a kind is shipped for.
 CREATURE_CATEGORIES = frozenset({CAT_BOSS_DROP, CAT_CREATURE_DROP, CAT_SKINNED, CAT_PICKPOCKET})
 
+# Brief N3: a VENDOR's name gets a kind too, so its page has a portrait and a map. A plain kind
+# (zero or more) is a creature a c = 1, 6, 7 or 12 row names and no vendor row does, exactly as
+# before. A vendor's kind is stored NEGATIVE, as -(2 * kind + both + 1), where both is 1 for a
+# name that is a vendor AND a creature some creature row names, and 0 for a vendor only. The one
+# added for the sign keeps a kind of 0 apart from its vendor twin. One integer per name still, and
+# a vendor costs a byte or two over what its kind costs.
+KIND_VENDOR_BOTH = 1
+
+# The quest ids a quest giver's two lists hold, in base 91 digits. Three, because Classic quest ids
+# run to 9,665 and two digits stop at 8,280.
+QG_QUEST_DIGITS = 3
+
 # ----- the map pins -----------------------------------------------------------------------
 #
 # Until 2026-09-20 this module stored no coordinate at all. It now ships a handful of pins per
@@ -498,6 +511,18 @@ def pack_kind(creature_type: int, family: int, min_level: int, max_level: int) -
     kind = max(0, min(creature_type, KIND_TYPE_SPAN - 1))
     beast = max(0, min(family, KIND_FAMILY_SPAN - 1))
     return kind + KIND_TYPE_SPAN * (low + KIND_LEVEL_SPAN * (band + KIND_BAND_SPAN * beast))
+
+
+def vendor_kind(packed: int, creature_too: bool) -> int:
+    """A packed kind marked as a vendor's (brief N3): negative, and odd inside where the name is a
+    creature some creature row names as well. See KIND_VENDOR_BOTH for the layout."""
+    both = KIND_VENDOR_BOTH if creature_too else 0
+    return -(2 * packed + both + 1)
+
+
+def pack_quests(quests: Sequence[int]) -> str:
+    """A quest giver's list (brief N3): each quest id as QG_QUEST_DIGITS base 91 digits."""
+    return "".join(pack_int(quest, QG_QUEST_DIGITS) for quest in quests)
 
 
 # ----- the facts, as plain data so a fixture can hand build them ----------------------------
@@ -734,6 +759,13 @@ class EraInput:
     object_spawns: tuple[Spawn, ...] = ()
     object_spawn_entries: dict[int, tuple[int, ...]] = field(default_factory=dict)
     object_points: dict[int, tuple[SpawnPoint, ...]] = field(default_factory=dict)
+    # Brief N3: `creature_questrelation` (who starts a quest) and `creature_involvedrelation` (who
+    # ends one), each as (creature id, quest id) in the dump's order, and the title of EVERY
+    # quest_template entry that has one, which is what names the quests a giver's page lists.
+    # Titles only: no quest text of any kind.
+    quest_starts: list[tuple[int, int]] = field(default_factory=list)
+    quest_ends: list[tuple[int, int]] = field(default_factory=list)
+    quest_names: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -766,6 +798,9 @@ class EraSources:
     # areaId -> the zone level UiMap id THIS build draws that area on, for every area `z` names
     # that resolves to one. An area with no entry has no map on this build.
     area_maps: dict[int, int] = field(default_factory=dict)
+    # Brief N3: a creature or vendor name's index into `s` -> (the quests it starts, the quests it
+    # ends), each a string packed by pack_quests, "" where it has none of that side.
+    quest_givers: dict[int, tuple[str, str]] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
 
@@ -780,6 +815,7 @@ class EraSources:
             "mp": dict(self.pins),
             "op": dict(self.object_pins),
             "ok": dict(self.object_kinds),
+            "qg": {index: list(pair) for index, pair in self.quest_givers.items()},
             "zm": dict(self.area_maps),
             "x": dict(self.list_index),
             "xl": list(self.lists),
@@ -898,6 +934,10 @@ WANTED_TABLES = (
     "npc_vendor",
     "npc_vendor_template",
     "quest_template",
+    # Brief N3: which creature starts a quest and which one ends it. Two columns each, a creature
+    # id and a quest id, and nothing else in either table.
+    "creature_questrelation",
+    "creature_involvedrelation",
 )
 
 LOOT_TABLES = {
@@ -1223,11 +1263,17 @@ def _absorb(
         # row is one member of a pool, so the point is a place the creature is found.
         reading.pools.add(_int(col("guid")))
         return
+    if table in ("creature_questrelation", "creature_involvedrelation"):
+        pair = (_int(col("id")), _int(col("quest")))
+        (era.quest_starts if table == "creature_questrelation" else era.quest_ends).append(pair)
+        return
     if table == "quest_template":
         qid = _int(col("entry"))
         title = (col("Title") or "").strip()
         if qid > 0:
             era.quest_ids.add(qid)
+            if title:
+                era.quest_names[qid] = title
         fixed: list[int] = []
         for key in ("RewItemId1", "RewItemId2", "RewItemId3", "RewItemId4"):
             value = _int(col(key))
@@ -2755,6 +2801,92 @@ def _object_names(
     return dict(sorted(found.items()))
 
 
+def _vendor_names(
+    entries: Mapping[int, Sequence[dict]],
+    leftovers: Mapping[int, Mapping[int, Sequence[dict]]],
+    strings: _Strings,
+) -> set[str]:
+    """Every vendor name a shipped row or a packed list names (brief N3).
+
+    These are the names a vendor's page can be opened on, so they are the ones that get a kind,
+    a portrait and pins beside the creatures'. Read off the rows while they still carry insertion
+    indexes, the way _object_names reads the object names.
+    """
+    found: set[str] = set()
+
+    def note(row: Mapping) -> None:
+        if row.get("c") == CAT_VENDOR and "n" in row and "t" not in row:
+            name = strings.value(row["n"])
+            if name:
+                found.add(name)
+
+    for rows in entries.values():
+        for row in rows:
+            note(row)
+    for by_kind_rows in leftovers.values():
+        for row in by_kind_rows.get(CAT_VENDOR, ()):
+            note(row)
+    return found
+
+
+def _handed_over(entries: Mapping[int, Sequence[dict]]) -> set[int]:
+    """Every quest a c = 3 row names, first or further: the quests the addon can already title."""
+    found: set[int] = set()
+    for rows in entries.values():
+        for row in rows:
+            if row["c"] == CAT_QUEST:
+                found.add(row["q"])
+                for further in row.get("m", ()):
+                    found.add(further["q"])
+    return found
+
+
+def _quest_givers(
+    era_input: EraInput,
+    names: set[str],
+    strings: _Strings,
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> dict[int, tuple[tuple[int, ...], tuple[int, ...]]]:
+    """A creature or vendor NAME's index into `s` -> (the quests it starts, the quests it ends).
+
+    Brief N3. Keyed by the name, the way `ck`, `cd` and `mp` are: every creature of one name is
+    the same giver to a player, so "Innkeeper Farley" starts what any creature called that
+    starts. Only a name a shipped row or list already names gets an entry (a creature row or a
+    vendor row): a quest giver nothing else in the table points at is a page nobody can open.
+
+    A quest is kept only where quest_template gives it a title, and a title that is scaffolding
+    is refused like a scaffolding name, because a quest the addon cannot title is a row that says
+    nothing. Each list is quest id ascending with repeats dropped; a quest a name both starts and
+    ends is in both.
+    """
+    by_id = era_input.creatures
+    lists: dict[str, tuple[set[int], set[int]]] = {}
+    for side, relation in ((0, era_input.quest_starts), (1, era_input.quest_ends)):
+        for creature_id, quest in relation:
+            facts = by_id.get(creature_id)
+            if facts is None or facts.name not in names:
+                dropped["questGiverNotShipped"] += 1
+                continue
+            title = era_input.quest_names.get(quest, "")
+            if not title:
+                dropped["questGiverUntitled"] += 1
+                continue
+            if is_scaffolding(title):
+                dropped["questGiverScaffolding"] += 1
+                continue
+            lists.setdefault(facts.name, (set(), set()))[side].add(quest)
+    out: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    for name in sorted(lists):
+        starts, ends = lists[name]
+        out[strings.add(name)] = (tuple(sorted(starts)), tuple(sorted(ends)))
+    counts["questGiverNames"] = len(out)
+    counts["questGiverStarts"] = sum(len(pair[0]) for pair in out.values())
+    counts["questGiverEnds"] = sum(len(pair[1]) for pair in out.values())
+    counts["questGiverBoth"] = sum(len(set(pair[0]) & set(pair[1])) for pair in out.values())
+    return out
+
+
 def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] = ()) -> EraSources:
     """Turn the two pinned databases into the table the addon ships, counting every refusal.
 
@@ -2779,6 +2911,9 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         "objectPinInsideInstance": 0,
         "objectPinOutsideMap": 0,
         "objectPinNoAreaKnown": 0,
+        "questGiverNotShipped": 0,
+        "questGiverUntitled": 0,
+        "questGiverScaffolding": 0,
     }
     counts: dict[str, int] = {
         "multiQuest": 0,
@@ -2847,11 +2982,39 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
             by_category[row["c"]] = by_category.get(row["c"], 0) + 1
 
     quest_titles = _quest_titles(era_input, entries, strings)
-    kinds = _creature_kinds(era_input, creature_names, strings, counts)
-    displays = _creature_displays(era_input, creature_names, strings, counts, dropped)
-    # The pins go last of the four, because a pin's own area is an area the player can now read
-    # and so has to reach `z` and `s` before the string table is sorted.
-    pins = _creature_pins(era_input, creature_names, strings, used_areas, counts, dropped)
+    # Brief N3: a vendor's name joins ck, cd and mp beside the creatures', so a vendor's page has a
+    # portrait and a map. One entry per name: a name that is a creature and a vendor both is one
+    # kind, one display and one set of pins, and its kind says it is both.
+    vendor_names = _vendor_names(entries, leftovers, strings)
+    npc_names = creature_names | vendor_names
+    kinds = _creature_kinds(era_input, npc_names, strings, counts)
+    for index in kinds:
+        name = strings.value(index)
+        if name in vendor_names:
+            kinds[index] = vendor_kind(kinds[index], name in creature_names)
+    displays = _creature_displays(era_input, npc_names, strings, counts, dropped)
+    # Who starts and ends which quest, for the same names (brief N3). A quest a giver lists that no
+    # c = 3 row titles gets its title in qt, which is the table the addon names a quest from first.
+    givers = _quest_givers(era_input, npc_names, strings, counts, dropped)
+    handed_over = _handed_over(entries)
+    added = 0
+    for starts, ends in givers.values():
+        for quest in (*starts, *ends):
+            if quest not in handed_over and quest not in quest_titles:
+                quest_titles[quest] = strings.add(era_input.quest_names[quest])
+                added += 1
+    counts["questGiverTitlesAdded"] = added
+    # The pins go last, because a pin's own area is an area the player can now read and so has to
+    # reach `z` and `s` before the string table is sorted.
+    pins = _creature_pins(era_input, npc_names, strings, used_areas, counts, dropped)
+    counts["vendorNames"] = len(vendor_names)
+    counts["vendorNamesSharedWithCreature"] = len(vendor_names & creature_names)
+    counts["vendorKinds"] = sum(1 for packed in kinds.values() if packed < 0)
+    counts["vendorDisplays"] = sum(1 for index in displays if strings.value(index) in vendor_names)
+    counts["vendorPinNames"] = sum(1 for index in pins if strings.value(index) in vendor_names)
+    counts["vendorPins"] = sum(
+        len(made) for index, made in pins.items() if strings.value(index) in vendor_names
+    )
     # The object pins (brief D7), for every object name a shipped row or list names. Shipped in
     # `op` rather than in `mp`: `s` is one string table, and a name can be a creature's and an
     # object's both, so one table keyed by name could not say whose pins it holds.
@@ -2877,6 +3040,9 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     quest_titles = {quest: remap[index] for quest, index in sorted(quest_titles.items())}
     kinds = {remap[index]: packed for index, packed in kinds.items()}
     displays = {remap[index]: display for index, display in displays.items()}
+    givers_out = {
+        remap[index]: (pack_quests(starts), pack_quests(ends)) for index, (starts, ends) in givers.items()
+    }
     pins_out = {
         remap[index]: "".join(pack_pin(pin.area, pin.x, pin.y) for pin in made)
         for index, made in pins.items()
@@ -2940,6 +3106,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     counts["questTitles"] = len(quest_titles)
     counts["kinds"] = len(kinds)
     counts["displays"] = len(displays)
+    counts["questRelationStartRows"] = len(era_input.quest_starts)
+    counts["questRelationEndRows"] = len(era_input.quest_ends)
     counts["areaMaps"] = len(area_maps_out)
     counts["areasWithNoMap"] = len(areas_out) - len(area_maps_out)
     counts["listsShipped"] = sum(len(by_kind_rows) for by_kind_rows in list_index.values())
@@ -2958,6 +3126,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         object_pins=dict(sorted(object_pins_out.items())),
         object_kinds=dict(sorted(object_kinds_out.items())),
         area_maps=area_maps_out,
+        quest_givers=dict(sorted(givers_out.items())),
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -2984,7 +3153,8 @@ def header_lines(table: EraSources) -> list[str]:
         "qt = { [questId] = string index }, ck = { [string index] = packed creature kind }, "
         "cd = { [string index] = creature display id }, "
         "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
-        "ok = { [string index] = object category }, zm = { [areaId] = uiMapId }, "
+        "ok = { [string index] = object category }, qg = { [string index] = { starts, ends } }, "
+        "zm = { [areaId] = uiMapId }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... } }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
@@ -3032,8 +3202,9 @@ def header_lines(table: EraSources) -> list[str]:
         "ck: what kind of creature a NAME is, one integer per name: CreatureType + "
         f"{KIND_TYPE_SPAN} * (MinLevel + {KIND_LEVEL_SPAN} * (MaxLevel less MinLevel + "
         f"{KIND_BAND_SPAN} * beast Family)). Present for the names c=1, 6, 7 and 12 rows and "
-        "their x lists use. Where two creatures share a name, the commoner type and the "
-        "widest level band.",
+        "their x lists use, and for the vendor names c=4 rows and lists use. A vendor's is "
+        "NEGATIVE, -(2 * kind + both + 1), both 1 where the name is a creature row's too. Where "
+        "two creatures share a name, the commoner type and the widest level band.",
         "cd: the CreatureDisplayInfo id the client draws that NAME's portrait from, keyed the "
         "way ck is. creature_template.ModelId1 (falling back to ModelId2..4 where it is 0), "
         "the commonest where creatures of one name disagree, and every id checked against THIS "
@@ -3057,6 +3228,10 @@ def header_lines(table: EraSources) -> list[str]:
         "11 chest; the lower where a name is filed under two), for every name op carries and "
         "no other, so the addon can say what a node is and whether it has a map without "
         "decoding a pin.",
+        "qg: the quests a creature or vendor NAME starts and ends (creature_questrelation, "
+        "creature_involvedrelation), keyed the way ck is: two packed strings, each quest id as "
+        f'{QG_QUEST_DIGITS} base 91 digits, ascending, "" for none. A quest in both lists is '
+        "both started and ended there. Every quest here is titled by a c=3 row or by qt.",
         "zm: the zone level UiMap id THIS build draws an area on, for every area z names that "
         "resolves to one. Absent means this build has no map for that area, which is every "
         "instance root area: this build ships no dungeon map at all, so a creature inside one "
@@ -3081,7 +3256,10 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('rowsWithChance', 0)} with a chance, {counts.get('rowsWithArea', 0)} with "
         f"an area, over {counts.get('strings', 0)} strings and {counts.get('areas', 0)} areas.",
         f"{counts.get('questTitles', 0)} quest titles in qt, {counts.get('kinds', 0)} creature "
-        f"kinds in ck, {counts.get('displays', 0)} creature display ids in cd, and "
+        f"kinds in ck ({counts.get('vendorKinds', 0)} of them vendors), "
+        f"{counts.get('displays', 0)} creature display ids in cd, "
+        f"{counts.get('questGiverNames', 0)} quest givers in qg (starts "
+        f"{counts.get('questGiverStarts', 0)}, ends {counts.get('questGiverEnds', 0)}), and "
         f"{counts.get('listEntries', 0)} further sources in "
         f"{counts.get('listsShipped', 0)} lists, stored as {counts.get('listsStored', 0)} "
         "distinct packed strings.",
