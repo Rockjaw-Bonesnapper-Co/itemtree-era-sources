@@ -34,6 +34,14 @@ tables to one number (1 Alliance, 2 Horde, 3 both) and shipped in `cf`, so a rec
 vendor is Alliance can say so. Every recipe vendor is a vendor the table names, so the recipe
 sources are covered by the same rule. Nothing else about a faction is shipped.
 
+Since 2026-09-29 (brief W12, on the owner's ruling of 2026-09-29) `quest_template.ReqItemId1..4`,
+read before only so a quest only drop could name its quest, ships as well, with the two new
+columns beside it, `ReqItemCount1..4`: per kept quest, the items it asks the player to bring and
+how many of each, in `qr`, so a quest item's "Used by" can name the quest. Ids and counts only,
+never the quest's text; an item this build does not ship is refused as a row for it would be.
+A `qr` quest nothing else titles gets its title in `qt`: an index into `s` where `s` holds the
+string, and otherwise the title itself as a plain string, so `s` never grows for `qr`.
+
 Since brief P6a three more tables are read, for the trainers: `npc_trainer` (a creature id and a
 spell id per row), `npc_trainer_template` (a template id and a spell id per row, joined to a
 creature through `creature_template.TrainerTemplateId`) and, from `spell_template`, the id, the
@@ -42,7 +50,7 @@ trainer's "learn" spell into the spell it teaches. Ids only: no spell name, no d
 cost, no required level or skill. A taught spell is kept only where THIS build's own
 `SkillLineAbility` files it under a profession or secondary skill line (the coordinator's decision
 on brief P6a: ItemTree's trainer rows are about recipes, a class trainer teaches no item, and the
-class trainers' 27,038 pairs would have taken the file past 1.6 MB), and the list ships
+class trainers' 27,038 pairs would have taken the file past the then 1.6 MB), and the list ships
 per trainer NAME in `tr`, so a trainer's page can say what it teaches and a spell's sources can
 name its trainers. A trainer is a creature the table lists, so it gets its portrait, pins, title
 and side through the same paths a vendor does.
@@ -434,6 +442,14 @@ KIND_VENDOR_BOTH = 1
 # run to 9,665 and two digits stop at 8,280.
 QG_QUEST_DIGITS = 3
 
+# Brief W12: what a quest asks the player to bring, in `qr`. One record per required item, the
+# item id in QR_ITEM_DIGITS base 91 digits and the count in QR_COUNT_DIGITS. Three for the item,
+# as a container's own id takes, because Classic item ids run past the 8,280 two digits hold; two
+# for the count, because the most any 1.12 quest asks for is 1,200. pack_int fails the
+# build rather than wrap if either is ever outgrown.
+QR_ITEM_DIGITS = 3
+QR_COUNT_DIGITS = 2
+
 # ----- the trainers (brief P6a) ---------------------------------------------------------------
 #
 # A trainer's list in `tr` is the spell ids it teaches, each as TR_SPELL_DIGITS base 91 digits.
@@ -451,7 +467,8 @@ SPELL_EFFECT_LEARN_SPELL = 36
 # SkillLineAbility (SKILL_CATEGORIES_READ), so a class spell is known and counted when it is
 # refused; only TRAINER_SKILL_CATEGORIES SHIP. The cut, decided on brief P6a: class trainers are
 # left out, because ItemTree's trainer rows are about recipes and a class trainer teaches no item,
-# and their 27,038 pairs took the file to 1,705,074 bytes, past its 1.6 MB budget. Adding 7 back
+# and their 27,038 pairs took the file to 1,705,074 bytes, past its then 1.6 MB budget (1.75 MB
+# since 2026-09-29, raised for brief W12's qr and qt string titles). Adding 7 back
 # here is the whole of undoing it (see docs/era-sources.md).
 SKILL_CATEGORY_CLASS = 7
 SKILL_CATEGORY_SECONDARY = 9
@@ -577,6 +594,13 @@ def vendor_kind(packed: int, creature_too: bool) -> int:
 def pack_quests(quests: Sequence[int]) -> str:
     """A quest giver's list (brief N3): each quest id as QG_QUEST_DIGITS base 91 digits."""
     return "".join(pack_int(quest, QG_QUEST_DIGITS) for quest in quests)
+
+
+def pack_requires(requires: Sequence[tuple[int, int]]) -> str:
+    """A quest's required items (brief W12): each as the item id then the count, in base 91."""
+    return "".join(
+        pack_int(item, QR_ITEM_DIGITS) + pack_int(count, QR_COUNT_DIGITS) for item, count in requires
+    )
 
 
 def pack_spells(spells: Sequence[int]) -> str:
@@ -757,9 +781,13 @@ class QuestFacts:
     races: int = 0
     # The items the quest hands over.
     items: tuple[int, ...] = ()
-    # The items the quest asks the player to bring. Read only so that a quest only drop can
-    # name the quest that makes it drop, never to describe the quest itself.
+    # The items the quest asks the player to bring, in the template's slot order. Read so that a
+    # quest only drop can name the quest that makes it drop and, since brief W12, so that a quest
+    # item can name the quest it is used by (`qr`). Never to describe the quest itself.
     requires: tuple[int, ...] = ()
+    # Brief W12: how many of each `requires` asks for, slot by slot (`ReqItemCount1..4`). Empty,
+    # or a count of 0, reads as one.
+    require_counts: tuple[int, ...] = ()
 
 
 @dataclass
@@ -861,7 +889,9 @@ class EraSources:
     rows: dict[int, list[dict]] = field(default_factory=dict)
     # questId -> its title's index into `s`, for the quests that make a quest only drop drop
     # and that no `c = 3` row names anywhere in the table.
-    quest_titles: dict[int, int] = field(default_factory=dict)
+    # Since brief W12 a value is either that index or, for a quest only `qr` carries whose title
+    # `s` does not hold, the title itself as a plain string.
+    quest_titles: dict[int, int | str] = field(default_factory=dict)
     # A creature name's index into `s` -> what kind of creature it is, packed by pack_kind.
     kinds: dict[int, int] = field(default_factory=dict)
     # A creature name's index into `s` -> the CreatureDisplayInfo id the client draws that
@@ -891,6 +921,9 @@ class EraSources:
     factions: dict[int, int] = field(default_factory=dict)
     # Brief P6a: a trainer NAME's index into `s` -> the spell ids it teaches, packed by pack_spells.
     trainers: dict[int, str] = field(default_factory=dict)
+    # Brief W12: questId -> the items it asks the player to bring with their counts, packed by
+    # pack_requires, for every kept quest that asks for an item this build ships.
+    quest_requires: dict[int, str] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
 
@@ -916,6 +949,7 @@ class EraSources:
             "st": dict(self.subnames),
             "cf": dict(self.factions),
             "tr": dict(self.trainers),
+            "qr": dict(self.quest_requires),
             "x": dict(self.list_index),
             "xl": list(self.lists),
         }
@@ -1418,10 +1452,13 @@ def _absorb(
         if qid > 0 and items:
             era.quest_rewards[qid] = (tuple(dict.fromkeys(fixed)), tuple(dict.fromkeys(choices)))
         requires: list[int] = []
-        for key in ("ReqItemId1", "ReqItemId2", "ReqItemId3", "ReqItemId4"):
-            value = _int(col(key))
+        require_counts: list[int] = []
+        for number in range(1, 5):
+            value = _int(col(f"ReqItemId{number}"))
             if value > 0:
                 requires.append(value)
+                # Brief W12, the owner's ruling of 2026-09-29: the count beside the id, a number.
+                require_counts.append(_int(col(f"ReqItemCount{number}")))
         # A quest that only asks for something is kept too: it hands nothing over, so it makes
         # no c=3 row, but it is what lets a quest only drop name the quest behind it.
         if title and (items or requires):
@@ -1431,6 +1468,7 @@ def _absorb(
                 races=_int(col("RequiredRaces")),
                 items=tuple(items),
                 requires=tuple(requires),
+                require_counts=tuple(require_counts),
             )
         return
 
@@ -2079,6 +2117,10 @@ class _Strings:
             self._index[value] = found
             self._values.append(value)
         return found
+
+    def find(self, value: str) -> int:
+        """The insertion index a string already has, or 0 where the table does not hold it."""
+        return self._index.get(value, 0)
 
     def value(self, index: int) -> str:
         """The string at one insertion index, or "" for an index this table never handed out."""
@@ -3165,6 +3207,50 @@ def _quest_givers(
     return out
 
 
+def _quest_requires(
+    era_input: EraInput,
+    shipped: Callable[[int], bool],
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> dict[int, tuple[tuple[int, int], ...]]:
+    """questId -> (item id, count) for each item the quest asks the player to bring (brief W12).
+
+    Owner, 2026-09-29 (queue item 136): Deviate Hide showed "Used by (0)" although its creature's
+    loot row says "only on the quest", because a quest's required items never reached the file
+    and the addon had no edge from the item to the quest. This is that edge, ids and counts only.
+
+    Every kept quest (a title, and items or requires) that asks for something is a candidate. A
+    required item this build does not ship, and does not ship as withheld, is refused the way a
+    row for it would be, and a quest left asking for nothing has no entry. A quest whose title is
+    scaffolding is refused like a scaffolding name. The items are in the template's slot order;
+    an item named in two slots is one entry with the two counts added. A count of 0 reads as one.
+    """
+    out: dict[int, tuple[tuple[int, int], ...]] = {}
+    for quest_id in sorted(era_input.quests):
+        quest = era_input.quests[quest_id]
+        if not quest.requires:
+            continue
+        if is_scaffolding(quest.title):
+            dropped["questRequiresScaffolding"] += 1
+            continue
+        wanted: dict[int, int] = {}
+        for slot, item in enumerate(quest.requires):
+            if not shipped(item):
+                dropped["questRequiresNotShipped"] += 1
+                continue
+            count = quest.require_counts[slot] if slot < len(quest.require_counts) else 0
+            wanted[item] = wanted.get(item, 0) + max(count, 1)
+        if wanted:
+            out[quest_id] = tuple(wanted.items())
+    counts["questRequiresQuests"] = len(out)
+    counts["questRequiresPairs"] = sum(len(pairs) for pairs in out.values())
+    counts["questRequiresItems"] = len({item for pairs in out.values() for item, _count in pairs})
+    counts["questRequiresCountAboveOne"] = sum(
+        1 for pairs in out.values() for _item, count in pairs if count > 1
+    )
+    return out
+
+
 def _vendor_creatures(era_input: EraInput) -> set[int]:
     """Every creature id that sells anything, by `npc_vendor` or by a vendor template."""
     found = {offer.vendor for offer in era_input.vendor_offers}
@@ -3330,6 +3416,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         "trainerSpellUnknown": 0,
         "trainerSpellClass": 0,
         "trainerNothingKnown": 0,
+        "questRequiresNotShipped": 0,
+        "questRequiresScaffolding": 0,
     }
     counts: dict[str, int] = {
         "multiQuest": 0,
@@ -3424,6 +3512,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
                 quest_titles[quest] = strings.add(era_input.quest_names[quest])
                 added += 1
     counts["questGiverTitlesAdded"] = added
+    # Brief W12: what each kept quest asks the player to bring, so a quest item's Used by can name
+    # the quest. Titled at the end, once every other string is in.
+    requires = _quest_requires(
+        era_input, lambda item: item in graph.items or item in withheld_ids, counts, dropped
+    )
     # Brief T1, the owner's ruling of 2026-09-27: the title under the name and the side, for the
     # vendors and the quest givers and enders the table names, and no other creature. Every
     # recipe's vendor is one of those vendors, so "Alliance only" on a recipe needs nothing more.
@@ -3455,6 +3548,28 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         1 for index in object_pins if strings.value(index) in creature_names
     )
 
+    # Brief W12: a qr quest no c = 3 row and no qt entry titles gets its title in qt. Where `s`
+    # already holds that very string the entry is its index, as every qt entry was before; where it
+    # does not, the entry is the title itself, a plain string (the coordinator's ruling of
+    # 2026-09-29). `s` never grows for qr: a list record's name field is PACK_NAME_DIGITS (two)
+    # digits, which stop at 8,280, and on 1.60.1.70009 `s` holds 7,852, so the 646 new titles qr
+    # would add would take it past what a list can index and fail the build.
+    by_index = 0
+    by_string = 0
+    for quest in requires:
+        if quest in handed_over or quest in quest_titles:
+            continue
+        title = era_input.quests[quest].title
+        index = strings.find(title)
+        if index:
+            quest_titles[quest] = index
+            by_index += 1
+        else:
+            quest_titles[quest] = title
+            by_string += 1
+    counts["questRequiresTitlesByIndex"] = by_index
+    counts["questRequiresTitlesByString"] = by_string
+
     table, remap = strings.sorted_table()
     for rows in entries.values():
         for row in rows:
@@ -3468,7 +3583,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
                 if "n" in row:
                     row["n"] = remap[row["n"]]
     areas_out = {area: remap[index] for area, index in sorted(used_areas.items())}
-    quest_titles = {quest: remap[index] for quest, index in sorted(quest_titles.items())}
+    # A qt value is an index into `s` (remapped with it) or, for a qr quest only, the title itself.
+    quest_titles = {
+        quest: title if isinstance(title, str) else remap[title]
+        for quest, title in sorted(quest_titles.items())
+    }
     kinds = {remap[index]: packed for index, packed in kinds.items()}
     subnames = {remap[index]: remap[title] for index, title in subnames.items()}
     sides = {remap[index]: side for index, side in sides.items()}
@@ -3538,6 +3657,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     counts["strings"] = len(table)
     counts["areas"] = len(areas_out)
     counts["questTitles"] = len(quest_titles)
+    counts["questTitlesAsString"] = sum(1 for title in quest_titles.values() if isinstance(title, str))
     counts["kinds"] = len(kinds)
     counts["displays"] = len(displays)
     counts["questRelationStartRows"] = len(era_input.quest_starts)
@@ -3564,6 +3684,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         subnames=dict(sorted(subnames.items())),
         factions=dict(sorted(sides.items())),
         trainers=dict(sorted(trainers_out.items())),
+        quest_requires={quest: pack_requires(pairs) for quest, pairs in sorted(requires.items())},
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -3587,12 +3708,13 @@ def header_lines(table: EraSources) -> list[str]:
     return [
         "Historical Classic Era sources. Facts only, linked by item id.",
         "{ s = {strings}, z = { [areaId] = string index }, r = { [itemId] = { row, row, ... } }, "
-        "qt = { [questId] = string index }, ck = { [string index] = packed creature kind }, "
+        "qt = { [questId] = string index or title }, ck = { [string index] = packed creature kind }, "
         "cd = { [string index] = creature display id }, "
         "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
         "ok = { [string index] = object category }, qg = { [string index] = { starts, ends } }, "
         "zm = { [areaId] = uiMapId }, st = { [string index] = string index }, "
         "cf = { [string index] = side }, tr = { [string index] = packed spell ids }, "
+        "qr = { [questId] = packed required items }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
         "g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
@@ -3636,8 +3758,10 @@ def header_lines(table: EraSources) -> list[str]:
         f"m: the other quests that hand the same item over (c=3), at most {MAX_FURTHER_QUESTS}: "
         "{ { q questId, n name, f faction }, ... }. Present only where there is more than one, "
         "so an Alliance player is never shown only the Horde quest.",
-        "qt: the title of a quest an o row names in q, for the quests no c=3 row names "
-        "anywhere in the table. Titles only, and the addon reads its own quest index first.",
+        "qt: the title of a quest an o row names in q, a qg list names or qr carries, for the "
+        "quests no c=3 row names anywhere in the table. A value is a NUMBER, an index into s, or "
+        "(only for a qr quest whose title s does not hold) a STRING, the title itself: test the "
+        "type. Titles only, and the addon reads its own quest index first.",
         "ck: what kind of creature a NAME is, one integer per name: CreatureType + "
         f"{KIND_TYPE_SPAN} * (MinLevel + {KIND_LEVEL_SPAN} * (MaxLevel less MinLevel + "
         f"{KIND_BAND_SPAN} * beast Family)). Present for the names c=1, 6, 7 and 12 rows and "
@@ -3691,7 +3815,15 @@ def header_lines(table: EraSources) -> list[str]:
         f"{TR_SPELL_DIGITS} base 91 digits, ascending. Only spells THIS build's SkillLineAbility "
         "files under a profession or secondary skill line: no class trainer. A spell's trainers "
         "are the "
-        "names whose list holds it.",
+        "names whose list holds it. "
+        "qr: what a quest asks the player to bring (quest_template.ReqItemId1..4 and "
+        "ReqItemCount1..4), keyed by quest id: one packed string, a run of fixed "
+        f"{QR_ITEM_DIGITS + QR_COUNT_DIGITS} byte records in the x lists' base 91 alphabet, most "
+        f"significant digit first: the item id ({QR_ITEM_DIGITS} digits) then how many "
+        f"({QR_COUNT_DIGITS} digits), in the quest's own slot order. Only items this build ships "
+        "(or withholds); a quest asking for none of them has no entry. An item's Used by quests "
+        "are the quests whose record holds it. Every quest here is titled by a c=3 row or by qt "
+        "(as an index or as a plain string; s gains no string for qr).",
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "
         "searched. x[itemId][c] is a 1 based number into xl, and xl holds each distinct list "
         "once. A list is a run of fixed width records of base 91 digits (the bytes 35 to 126 "
@@ -3723,7 +3855,11 @@ def header_lines(table: EraSources) -> list[str]:
         f"Horde {counts.get('factionsHorde', 0)}, both {counts.get('factionsBoth', 0)}); "
         f"{counts.get('trainerNames', 0)} trainers in tr ({counts.get('trainerCreatures', 0)} "
         f"creatures) teaching {counts.get('trainerPairs', 0)} name and spell pairs over "
-        f"{counts.get('trainerSpells', 0)} spells, profession and secondary only.",
+        f"{counts.get('trainerSpells', 0)} spells, profession and secondary only; "
+        f"{counts.get('questRequiresQuests', 0)} quests in qr asking for "
+        f"{counts.get('questRequiresItems', 0)} items ({counts.get('questRequiresPairs', 0)} quest "
+        f"and item pairs; {counts.get('questRequiresTitlesByIndex', 0)} titled in qt by index, "
+        f"{counts.get('questRequiresTitlesByString', 0)} by string).",
         f"{counts.get('pins', 0)} map pins in mp over {counts.get('pinNames', 0)} names and "
         f"{counts.get('pinGroups', 0)} name and area groups, standing for "
         f"{counts.get('pinSpawnsPlaced', 0)} spawns; {counts.get('objectPins', 0)} object map pins "
