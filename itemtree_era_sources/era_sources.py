@@ -42,6 +42,17 @@ never the quest's text; an item this build does not ship is refused as a row for
 A `qr` quest nothing else titles gets its title in `qt`: an index into `s` where `s` holds the
 string, and otherwise the title itself as a plain string, so `s` never grows for `qr`.
 
+Since 2026-09-29 (brief W15, owner QA of 2026-09-29: "Quest: Deviate Hides (1486)" showed no
+giver) every creature `creature_questrelation` or `creature_involvedrelation` names for a titled
+quest ships as a name of its own, even where it drops, sells and trains nothing: its name in
+`s`, its kind in `ck`, its display id in `cd`, its pins in `mp`, its `SubName` in `st`, its side
+in `cf` and its quest lists in `qg`, read by exactly the rules those columns already follow.
+Brief N3 had shipped a giver only where another row already named it. Nothing new is read, and a
+creature with no quest link is untouched. Gameobject givers are not read (the objects this
+module reads are loot sources only). So that a list record's two digit name field still fits
+once `s` passes 8,280 strings, such an `s` is two sorted runs: the names the lists carry, then
+the rest. A table that fits stays one sorted run.
+
 Since brief P6a three more tables are read, for the trainers: `npc_trainer` (a creature id and a
 spell id per row), `npc_trainer_template` (a template id and a spell id per row, joined to a
 creature through `creature_template.TrainerTemplateId`) and, from `spell_template`, the id, the
@@ -468,7 +479,8 @@ SPELL_EFFECT_LEARN_SPELL = 36
 # refused; only TRAINER_SKILL_CATEGORIES SHIP. The cut, decided on brief P6a: class trainers are
 # left out, because ItemTree's trainer rows are about recipes and a class trainer teaches no item,
 # and their 27,038 pairs took the file to 1,705,074 bytes, past its then 1.6 MB budget (1.75 MB
-# since 2026-09-29, raised for brief W12's qr and qt string titles). Adding 7 back
+# since 2026-09-29, raised for brief W12's qr and qt string titles; 2.0 MB since the same day,
+# raised for brief W15's quest givers). Adding 7 back
 # here is the whole of undoing it (see docs/era-sources.md).
 SKILL_CATEGORY_CLASS = 7
 SKILL_CATEGORY_SECONDARY = 9
@@ -2126,12 +2138,20 @@ class _Strings:
         """The string at one insertion index, or "" for an index this table never handed out."""
         return self._values[index - 1] if 0 < index <= len(self._values) else ""
 
-    def sorted_table(self) -> tuple[list[str], dict[int, int]]:
+    def sorted_table(self, first: Collection[int] = ()) -> tuple[list[str], dict[int, int]]:
         """The strings in sorted order, and a remap from the insertion index to the new one.
 
         Sorting keeps the file stable: the same inputs always compile to the same bytes.
+
+        `first` is insertion indexes that must take the lowest numbers once the table is too long
+        for them (brief W15, 2026-09-29): the names a packed list record carries, whose field is
+        PACK_NAME_DIGITS base 91 digits and stops at 8,280. A table longer than that is two sorted
+        runs, those strings and then every other one, so every list record still fits; a table
+        that fits is the one sorted run it always was, so a small table's indexes do not move.
         """
-        order = sorted(self._index)
+        fits = len(self._values) < PACK_BASE**PACK_NAME_DIGITS
+        front = set() if fits else {self._values[i - 1] for i in first if 0 < i <= len(self._values)}
+        order = sorted(front) + sorted(value for value in self._index if value not in front)
         remap = {self._index[value]: position + 1 for position, value in enumerate(order)}
         return order, remap
 
@@ -3161,6 +3181,29 @@ def _handed_over(entries: Mapping[int, Sequence[dict]]) -> set[int]:
     return found
 
 
+def _giver_names(era_input: EraInput) -> set[str]:
+    """Every creature NAME that starts or ends a quest the table can title (brief W15).
+
+    Owner QA, 2026-09-29: "Quest: Deviate Hides (1486)" showed no giver, because Nalpak gives
+    and takes it and Nalpak drops, sells and trains nothing, so brief N3's rule (a giver ships
+    only where some other row already names it) left him out. Since 2026-09-29 every such name
+    ships: it joins the creature, vendor and trainer names in `ck`, `cd`, `mp`, `st`, `cf` and
+    `qg`. The same tests _quest_givers applies decide it: a creature with no template, no name
+    or a scaffolding name gives nothing, and a quest with no title or a scaffolding one is no
+    reason to ship a name. A creature with no quest link is not read here at all.
+    """
+    found: set[str] = set()
+    for relation in (era_input.quest_starts, era_input.quest_ends):
+        for creature_id, quest in relation:
+            facts = era_input.creatures.get(creature_id)
+            if facts is None or is_scaffolding(facts.name):
+                continue
+            title = era_input.quest_names.get(quest, "")
+            if title and not is_scaffolding(title):
+                found.add(facts.name)
+    return found
+
+
 def _quest_givers(
     era_input: EraInput,
     names: set[str],
@@ -3172,8 +3215,10 @@ def _quest_givers(
 
     Brief N3. Keyed by the name, the way `ck`, `cd` and `mp` are: every creature of one name is
     the same giver to a player, so "Innkeeper Farley" starts what any creature called that
-    starts. Only a name a shipped row or list already names gets an entry (a creature row or a
-    vendor row): a quest giver nothing else in the table points at is a page nobody can open.
+    starts. `names` is every name the table ships a page for, which since brief W15 (2026-09-29)
+    includes every giver _giver_names finds, so a giver that drops, sells and trains nothing,
+    such as Nalpak, gets its entry too. What `questGiverNotShipped` counts now is a relation row
+    whose creature has no template, no name or a scaffolding name.
 
     A quest is kept only where quest_template gives it a title, and a title that is scaffolding
     is refused like a scaffolding name, because a quest the addon cannot title is a row that says
@@ -3185,7 +3230,7 @@ def _quest_givers(
     for side, relation in ((0, era_input.quest_starts), (1, era_input.quest_ends)):
         for creature_id, quest in relation:
             facts = by_id.get(creature_id)
-            if facts is None or facts.name not in names:
+            if facts is None:
                 dropped["questGiverNotShipped"] += 1
                 continue
             title = era_input.quest_names.get(quest, "")
@@ -3194,6 +3239,9 @@ def _quest_givers(
                 continue
             if is_scaffolding(title):
                 dropped["questGiverScaffolding"] += 1
+                continue
+            if facts.name not in names:
+                dropped["questGiverNotShipped"] += 1
                 continue
             lists.setdefault(facts.name, (set(), set()))[side].add(quest)
     out: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
@@ -3204,6 +3252,8 @@ def _quest_givers(
     counts["questGiverStarts"] = sum(len(pair[0]) for pair in out.values())
     counts["questGiverEnds"] = sum(len(pair[1]) for pair in out.values())
     counts["questGiverBoth"] = sum(len(set(pair[0]) & set(pair[1])) for pair in out.values())
+    # Brief W15: how many distinct quests have a giver or an ender the table names.
+    counts["questGiverQuests"] = len({quest for pair in out.values() for side in pair for quest in side})
     return out
 
 
@@ -3494,7 +3544,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # title and a side. A trainer's kind stays a plain kind: `tr` is what says it teaches.
     trainer_lists, teachers = _trainer_lists(era_input, counts, dropped)
     trainer_names = set(trainer_lists)
-    npc_names = creature_names | vendor_names | trainer_names
+    # Brief W15 (2026-09-29): every creature that starts or ends a titled quest ships as a name
+    # of its own, with its kind, portrait, pins, title, side and quest lists, even where it drops,
+    # sells and trains nothing. Its kind stays a plain kind: `qg` is what says it gives quests.
+    giver_names = _giver_names(era_input)
+    npc_names = creature_names | vendor_names | trainer_names | giver_names
     kinds = _creature_kinds(era_input, npc_names, strings, counts)
     for index in kinds:
         name = strings.value(index)
@@ -3535,6 +3589,10 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         len(made) for index, made in pins.items() if strings.value(index) in vendor_names
     )
     counts["trainerNamesSharedWithOthers"] = len(trainer_names & (creature_names | vendor_names))
+    giver_only = giver_names - creature_names - vendor_names - trainer_names
+    counts["giverOnlyNames"] = len(giver_only)
+    counts["giverOnlyPinNames"] = sum(1 for index in pins if strings.value(index) in giver_only)
+    counts["giverOnlyTitles"] = sum(1 for index in subnames if strings.value(index) in giver_only)
     counts["trainerDisplays"] = sum(1 for index in displays if index in trainers)
     counts["trainerPinNames"] = sum(1 for index in pins if index in trainers)
     counts["trainerTitles"] = sum(1 for index in subnames if index in trainers)
@@ -3552,8 +3610,9 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # already holds that very string the entry is its index, as every qt entry was before; where it
     # does not, the entry is the title itself, a plain string (the coordinator's ruling of
     # 2026-09-29). `s` never grows for qr: a list record's name field is PACK_NAME_DIGITS (two)
-    # digits, which stop at 8,280, and on 1.60.1.70009 `s` holds 7,852, so the 646 new titles qr
-    # would add would take it past what a list can index and fail the build.
+    # digits, which stop at 8,280, and before brief W15 `s` held 7,852 on 1.60.1.70009, so the
+    # 646 new titles qr would add would have taken it past what a list can index. Brief W15 took
+    # `s` past 8,280 anyway and put the list names first instead (see _Strings.sorted_table).
     by_index = 0
     by_string = 0
     for quest in requires:
@@ -3570,7 +3629,17 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     counts["questRequiresTitlesByIndex"] = by_index
     counts["questRequiresTitlesByString"] = by_string
 
-    table, remap = strings.sorted_table()
+    # Brief W15: the names a list record packs go first, so their two digit field always fits.
+    listed_names = {
+        row["n"]
+        for by_kind_rows in leftovers.values()
+        for rest in by_kind_rows.values()
+        for row in rest
+        if row.get("n")
+    }
+    table, remap = strings.sorted_table(listed_names)
+    counts["stringsListed"] = len(listed_names)
+    counts["stringsListedFirst"] = int(len(table) >= PACK_BASE**PACK_NAME_DIGITS)
     for rows in entries.values():
         for row in rows:
             if "n" in row:
@@ -3726,7 +3795,11 @@ def header_lines(table: EraSources) -> list[str]:
         "row = { c category, n name (index into s), a areaId, p chance, q questId, f faction, "
         "m {further quests}, i container item id, k vendor stock, o quest only, t how many "
         "in all, lo/hi level band }",
-        "Every key but c is optional. Read what your category promises and nothing else.",
+        "Every key but c is optional. Read what your category promises and nothing else. "
+        "s: every string once, sorted; once it holds more than 8,280 strings (it does since "
+        "2026-09-29) in two sorted runs: first the names an xl list record carries, whose field is "
+        "two base 91 digits and stops at 8,280, then every other string. The order means nothing "
+        "else; look a string up by its index.",
         "c: 1 boss drop, 2 zone drop (reserved, never emitted), 3 quest, 4 vendor, 5 world "
         "drop, 6 creature drop, 7 skinned from, 8 herb node, 9 mining vein, 10 fished, "
         "11 world object or chest, 12 pickpocketed, 13 found inside a container item.",
@@ -3766,7 +3839,9 @@ def header_lines(table: EraSources) -> list[str]:
         f"{KIND_TYPE_SPAN} * (MinLevel + {KIND_LEVEL_SPAN} * (MaxLevel less MinLevel + "
         f"{KIND_BAND_SPAN} * beast Family)). Present for the names c=1, 6, 7 and 12 rows and "
         "their x lists use, for the vendor names c=4 rows and lists use, and for the trainer "
-        "names tr carries (a trainer's is a plain kind). A vendor's is "
+        "names tr carries (a trainer's is a plain kind), and since 2026-09-29 for every quest "
+        "giver and ender qg carries, including one that drops, sells and trains nothing (a "
+        "plain kind: qg is what says it gives quests). A vendor's is "
         "NEGATIVE, -(2 * kind + both + 1), both 1 where the name is a creature row's too. Where "
         "two creatures share a name, the commoner type and the widest level band.",
         "cd: the CreatureDisplayInfo id the client draws that NAME's portrait from, keyed the "
@@ -3792,10 +3867,13 @@ def header_lines(table: EraSources) -> list[str]:
         "11 chest; the lower where a name is filed under two), for every name op carries and "
         "no other, so the addon can say what a node is and whether it has a map without "
         "decoding a pin.",
-        "qg: the quests a creature or vendor NAME starts and ends (creature_questrelation, "
+        "qg: the quests a creature NAME starts and ends (creature_questrelation, "
         "creature_involvedrelation), keyed the way ck is: two packed strings, each quest id as "
         f'{QG_QUEST_DIGITS} base 91 digits, ascending, "" for none. A quest in both lists is '
-        "both started and ended there. Every quest here is titled by a c=3 row or by qt.",
+        "both started and ended there. Every quest here is titled by a c=3 row or by qt. Since "
+        "2026-09-29 every creature that starts or ends a titled quest has an entry, not only "
+        "one that drops, sells or trains something: such a giver ships its name, ck, cd, mp, st "
+        "and cf the way a vendor does. Object givers are not read.",
         "zm: the zone level UiMap id THIS build draws an area on, for every area z names that "
         "resolves to one. Absent means this build has no map for that area, which is every "
         "instance root area: this build ships no dungeon map at all, so a creature inside one "
@@ -3846,8 +3924,9 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('questTitles', 0)} quest titles in qt, {counts.get('kinds', 0)} creature "
         f"kinds in ck ({counts.get('vendorKinds', 0)} of them vendors), "
         f"{counts.get('displays', 0)} creature display ids in cd, "
-        f"{counts.get('questGiverNames', 0)} quest givers in qg (starts "
-        f"{counts.get('questGiverStarts', 0)}, ends {counts.get('questGiverEnds', 0)}), and "
+        f"{counts.get('questGiverNames', 0)} quest givers in qg ({counts.get('giverOnlyNames', 0)} "
+        f"of them givers only; starts {counts.get('questGiverStarts', 0)}, ends "
+        f"{counts.get('questGiverEnds', 0)}, {counts.get('questGiverQuests', 0)} quests in all), and "
         f"{counts.get('listEntries', 0)} further sources in "
         f"{counts.get('listsShipped', 0)} lists, stored as {counts.get('listsStored', 0)} "
         f"distinct packed strings; {counts.get('subnames', 0)} titles in st and "
