@@ -510,6 +510,22 @@ class NewBossRow:
 
 
 @dataclass(frozen=True)
+class MouthRow:
+    """One row of curated/instance_mouths.json that passed its checks (brief W17): the outdoor
+    mouth of an instance, the spot players look for on the zone map, which for some places is
+    well away from the portal the Map row states (eu, ex, ey). The position is in tenths of a
+    percent, as the entrance pin's is."""
+
+    map: int
+    ui_map: int
+    x: int
+    y: int
+    # Whether the owner has stood on the spot in game. The row ships either way; the compile
+    # report marks an unverified one so the pin is checked in the QA build.
+    verified: bool = False
+
+
+@dataclass(frozen=True)
 class KillCriterion:
     """One `Criteria` row of Type 0 (kill a creature, `Asset` the creature id) with the
     `Description_lang` of each `CriteriaTree` row that holds it (`texts`) and of each such
@@ -551,6 +567,8 @@ class BossLootInput:
     kill_criteria: list[KillCriterion] = field(default_factory=list)
     # curated/new_bosses.json, the rows that passed: encounter id -> the row.
     curated_bosses: dict[int, NewBossRow] = field(default_factory=dict)
+    # curated/instance_mouths.json, every row checked (brief W17): Map id -> the mouth.
+    mouths: dict[int, MouthRow] = field(default_factory=dict)
     # Every cache file left out, cache disagreement and curated row refused, for the summary.
     notes: list[str] = field(default_factory=list)
 
@@ -1529,6 +1547,7 @@ def derive(
         area = era_input.instance_areas.get(map_id, 0)
         where = stage.location(m, area)
         pin = entrance_pin(facts, m, era_input.map_bounds, where.zone)
+        mouth = facts.mouths.get(map_id)
         place = {
             "name": m.name,
             "k": INSTANCE_KINDS[m.instance_type],
@@ -1541,7 +1560,15 @@ def derive(
             "sz": m.max_players or None,
             "g": 1 if new else None,
         }
-        raw.append((place, entries, {"lv": lo_from, "hi": hi_from, "where": where, "pin": pin}))
+        raw.append(
+            (place, entries, {"lv": lo_from, "hi": hi_from, "where": where, "pin": pin, "mouth": mouth})
+        )
+    shipped = {place["m"] for place, _entries, _how in raw if place.get("m") is not None}
+    for map_id in sorted(facts.mouths):
+        if map_id not in shipped:
+            raise BossLootError(
+                f"{MOUTHS_FILE}: the row for map {map_id} names no place in the index; fix or remove the row"
+            )
 
     raw.sort(
         key=lambda item: (band(item[0]["lv"]), item[0]["lv"] or 0, item[0]["k"], item[0]["name"].lower())
@@ -1564,6 +1591,7 @@ def derive(
     for place, entries, how in raw:
         where: Location = how["where"]
         pin: EntrancePin | None = how.get("pin")
+        mouth: MouthRow | None = how.get("mouth")
         numbers: list[int] = []
         for entry in entries:
             bosses.append(
@@ -1598,6 +1626,9 @@ def derive(
             "eu": pin.ui_map if pin else None,
             "ex": pin.x if pin else None,
             "ey": pin.y if pin else None,
+            "mu": mouth.ui_map if mouth else None,
+            "mx": mouth.x if mouth else None,
+            "my": mouth.y if mouth else None,
             "sz": place.get("sz"),
             "g": place.get("g"),
             "b": numbers,
@@ -1619,6 +1650,7 @@ def derive(
                 "continent": where.continent,
                 "whereFrom": where.source,
                 "entrance": (pin.ui_map, pin.x, pin.y) if pin else None,
+                "mouth": (mouth.ui_map, mouth.x, mouth.y, mouth.verified) if mouth else None,
             }
         )
     bosses = [{key: value for key, value in boss.items() if value is not None} for boss in bosses]
@@ -1645,6 +1677,8 @@ def derive(
         "withZone": sum(1 for p in places if "ez" in p),
         "withContinent": sum(1 for p in places if "ec" in p),
         "withEntrance": sum(1 for p in places if "eu" in p),
+        "withMouth": sum(1 for p in places if "mu" in p),
+        "withMouthUnverified": sum(1 for n in notes if n["mouth"] and not n["mouth"][3]),
         "cacheFiles": facts.cache_files,
         **stage.named,
     }
@@ -1707,7 +1741,9 @@ def header_lines(table: BossLoot) -> list[str]:
         "id EraSources uses, an the AreaTable name where it differs from n, z (k=3) the zones, "
         "ez the entrance zone's name (absent for k=3), ec the continent's name, "
         "eu/ex/ey the entrance pin (the zone UiMapID, and x from the left and y from the top in "
-        f"tenths of a percent, 0 to {ENTRANCE_SCALE}; all three or none), "
+        f"tenths of a percent, 0 to {ENTRANCE_SCALE}; all three or none; the instance portal), "
+        "mu/mx/my the outdoor mouth players look for, where it is hand checked (the same shape "
+        "as eu/ex/ey; all three or none; either set may be there without the other), "
         "sz players, g 1 = new in Forever, b = {indices into b, in draw order} }. Places are in "
         "draw order: band (ceil(lv / 10), no lv last), then lv, then k, then name.",
         "b = { n name, r rank (1 boss, 2 rare elite, 3 rare, 4 chest), lo/hi creature levels, "
@@ -1738,6 +1774,11 @@ def header_lines(table: BossLoot) -> list[str]:
     ]
 
 
+def _mouth_words(mouth: tuple[int, int, int, bool]) -> str:
+    ui_map, x, y, verified = mouth
+    return f" (mouth {x} {y} on UiMap {ui_map}{'' if verified else ', unverified'})"
+
+
 def location_lines(table: BossLoot) -> list[str]:
     """The compile's report of where each place is (brief BL13a): one line per place with the
     source its ez and ec came from (and its entrance pin, brief W16), then the count per source,
@@ -1753,6 +1794,7 @@ def location_lines(table: BossLoot) -> list[str]:
             f"{source:<4} {note['name']}: {note['zone'] or '-'}, {note['continent'] or '-'}"
             + (", new" if note["new"] else "")
             + (" (entrance {1} {2} on UiMap {0})".format(*note["entrance"]) if note.get("entrance") else "")
+            + (_mouth_words(note["mouth"]) if note.get("mouth") else "")
         )
         if note["kind"] != KIND_WORLD_BOSS and not note["new"] and not (note["zone"] and note["continent"]):
             unresolved.append(note["name"])
@@ -1986,6 +2028,79 @@ def validate_new_bosses(
     return rows, refused
 
 
+MOUTHS_FILE = "curated/instance_mouths.json"
+
+
+def _percent_value(value) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and 0 <= value <= 100
+
+
+def load_mouths(path: Path) -> dict:
+    """curated/instance_mouths.json as read. A file that cannot be read at all fails."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BossLootError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("mouths", []), list):
+        raise BossLootError(f"{path} is not a JSON object with a mouths list")
+    return raw
+
+
+def validate_mouths(
+    raw: dict, maps: Mapping[int, MapFacts], ui_maps: Mapping[int, UiMapFacts]
+) -> dict[int, MouthRow]:
+    """Every row of curated/instance_mouths.json, by Map id. One bad row refuses the whole file
+    (BossLootError, the row named): the rows are few and each was checked in game, so a slip is
+    fixed rather than shipped around. A row names an instance Map of this build, a zone UiMap
+    (Type 3) and x, y in percent (0 to 100, as the game shows them), with a provenance (where the
+    numbers came from), the YYYY-MM-DD the row was written or last reviewed, and an optional
+    boolean `verified` (the owner stood on the spot; false when absent). Neither provenance nor
+    verified reaches the shipped file. Whether the map is a place in the index is checked by derive."""
+    rows: dict[int, MouthRow] = {}
+    for index, row in enumerate(raw.get("mouths") or [], start=1):
+        name = row.get("name") if isinstance(row, dict) else None
+        what = f"{MOUTHS_FILE} row {index} ({name or 'unnamed'})"
+        if not isinstance(row, dict):
+            raise BossLootError(f"{what}: not an object")
+        map_id = row.get("mapId")
+        m = maps.get(map_id) if _positive(map_id) else None
+        if m is None or m.instance_type not in INSTANCE_KINDS:
+            raise BossLootError(f"{what}: mapId {map_id!r} is not an instance Map of this build")
+        if map_id in rows:
+            raise BossLootError(f"{what}: mapId {map_id} is repeated")
+        ui_map = row.get("uiMap")
+        ui = ui_maps.get(ui_map) if _positive(ui_map) else None
+        if ui is None:
+            raise BossLootError(f"{what}: uiMap {ui_map!r} is not a UiMap of this build")
+        if ui.type != UI_MAP_ZONE:
+            raise BossLootError(f"{what}: uiMap {ui_map} ({ui.name}) is not a zone map (Type {ui.type})")
+        x, y = row.get("x"), row.get("y")
+        if not (_percent_value(x) and _percent_value(y)):
+            raise BossLootError(f"{what}: x {x!r} and y {y!r} must be numbers from 0 to 100")
+        if not isinstance(row.get("provenance"), str) or not row["provenance"]:
+            raise BossLootError(f"{what}: no provenance")
+        if not isinstance(row.get("checked"), str) or not _DATE.match(row["checked"]):
+            raise BossLootError(f"{what}: checked must be a YYYY-MM-DD date")
+        verified = row.get("verified", False)
+        if not isinstance(verified, bool):
+            raise BossLootError(f"{what}: verified must be true or false")
+
+        def tenths(percent: float) -> int:
+            return max(0, min(ENTRANCE_SCALE, round(percent * ENTRANCE_SCALE / 100.0)))
+
+        rows[map_id] = MouthRow(map_id, ui_map, tenths(x), tenths(y), verified)
+    return rows
+
+
+def read_mouths(
+    path: Path | None, maps: Mapping[int, MapFacts], ui_maps: Mapping[int, UiMapFacts]
+) -> dict[int, MouthRow]:
+    """The checked mouths, or none where there is no file: no file, no fields."""
+    if path is None or not path.is_file():
+        return {}
+    return validate_mouths(load_mouths(path), maps, ui_maps)
+
+
 def gather_input(
     conn: sqlite3.Connection,
     build: str,
@@ -1994,10 +2109,12 @@ def gather_input(
     cmangos_path: Path,
     creature_caches: Sequence[Path] = (),
     new_bosses_path: Path | None = None,
+    mouths_path: Path | None = None,
 ) -> BossLootInput:
     """Read the client tables of both builds and the credits. Everything here is I/O.
     `creature_caches` are the creaturecache.wdb files to read (the client's own first), and
-    `new_bosses_path` is curated/new_bosses.json where it is there."""
+    `new_bosses_path` is curated/new_bosses.json and `mouths_path` curated/instance_mouths.json,
+    each where it is there."""
     maps = {
         _int(row["ID"]): MapFacts(
             id=_int(row["ID"]),
@@ -2113,6 +2230,7 @@ def gather_input(
             load_new_bosses(new_bosses_path), encounters, baseline_encounters
         )
         notes.extend(refused)
+    mouths = read_mouths(mouths_path, maps, ui_maps)
     return BossLootInput(
         maps=maps,
         baseline_maps=baseline_maps,
@@ -2130,5 +2248,6 @@ def gather_input(
         cached_creatures=merged.creatures,
         cache_files=len(merged.files_read),
         curated_bosses=curated,
+        mouths=mouths,
         notes=notes,
     )
