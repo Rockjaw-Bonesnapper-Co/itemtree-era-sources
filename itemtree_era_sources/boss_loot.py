@@ -111,6 +111,8 @@ SHARED_SPAWN_YARDS = 4.0
 # A same name outdoor area is matched only where the shorter of the two names is this long, so
 # "The Den" never names Starfall Barrow Den and "The Maul" is not read as Dire Maul.
 NAMESAKE_MIN_CHARS = 6
+# The entrance pin (brief W16): a position on a zone map in tenths of a percent, 0 to this.
+ENTRANCE_SCALE = 1000
 # The shipped file may not grow past this. The plan estimates 60 to 110 KB.
 MAX_FILE_BYTES = 200 * 1024
 
@@ -1284,6 +1286,61 @@ def entrance_zones(map_facts: MapFacts, bounds: Mapping[tuple[int, int], era_mod
     )
 
 
+@dataclass(frozen=True)
+class EntrancePin:
+    """Where a place's entrance is drawn (brief W16): the zone UiMap and the position on it in
+    tenths of a percent, x from the left and y from the top."""
+
+    ui_map: int
+    x: int
+    y: int
+
+
+def pin_position(box: era_mod.MapBounds, x: float, y: float) -> tuple[int, int]:
+    """A world position on one zone map in tenths of a percent (0 to ENTRANCE_SCALE), by the
+    same axis rule as the EraSources pins (`era_sources.map_position`): world x drives the
+    map's y and world y the map's x, both inverted, then the assignment's UiMin and UiMax."""
+    across, down = era_mod.map_position(box, x, y)
+
+    def tenths(percent: float) -> int:
+        return max(0, min(ENTRANCE_SCALE, round(percent * ENTRANCE_SCALE / 100.0)))
+
+    return tenths(across), tenths(down)
+
+
+def entrance_pin(
+    facts: BossLootInput,
+    map_facts: MapFacts,
+    bounds: Mapping[tuple[int, int], era_mod.MapBounds],
+    zone: str = "",
+) -> EntrancePin | None:
+    """The place's entrance as a pin on a zone map: the Map row's corpse position inside a zone
+    UiMap (Type 3) assigned to CorpseMapID. Where several hold it, the one named `zone` (the
+    place's ez), else the smallest region, then the lowest UiMap id. None where the row states
+    no position (CorpseMapID -1, or 0, 0) or no zone map holds it."""
+    if map_facts.corpse_map < 0 or (map_facts.corpse_x, map_facts.corpse_y) == (0.0, 0.0):
+        return None
+    x, y = map_facts.corpse_x, map_facts.corpse_y
+    held = [
+        box
+        for (ui_map, map_id), box in bounds.items()
+        if map_id == map_facts.corpse_map
+        and ui_map in facts.ui_maps
+        and facts.ui_maps[ui_map].type == UI_MAP_ZONE
+        and box.min_x <= x <= box.max_x
+        and box.min_y <= y <= box.max_y
+    ]
+    if not held:
+        return None
+    named = [box for box in held if zone and facts.ui_maps[box.ui_map].name == zone]
+    box = min(
+        named or held,
+        key=lambda b: ((b.max_x - b.min_x) * (b.max_y - b.min_y), b.ui_map),
+    )
+    across, down = pin_position(box, x, y)
+    return EntrancePin(box.ui_map, across, down)
+
+
 def zoned_points(era_input: era_mod.EraInput) -> list[tuple[int, float, float, int]]:
     """(map, world x, world y, zone UiMap) for every pfQuest spawn whose area this build draws on
     a zone map: pfQuest's percentage turned back into a world position by the zone's own
@@ -1471,6 +1528,7 @@ def derive(
         lo, hi, lo_from, hi_from = _place_levels(stage, m, entries)
         area = era_input.instance_areas.get(map_id, 0)
         where = stage.location(m, area)
+        pin = entrance_pin(facts, m, era_input.map_bounds, where.zone)
         place = {
             "name": m.name,
             "k": INSTANCE_KINDS[m.instance_type],
@@ -1483,7 +1541,7 @@ def derive(
             "sz": m.max_players or None,
             "g": 1 if new else None,
         }
-        raw.append((place, entries, {"lv": lo_from, "hi": hi_from, "where": where}))
+        raw.append((place, entries, {"lv": lo_from, "hi": hi_from, "where": where, "pin": pin}))
 
     raw.sort(
         key=lambda item: (band(item[0]["lv"]), item[0]["lv"] or 0, item[0]["k"], item[0]["name"].lower())
@@ -1505,6 +1563,7 @@ def derive(
     notes: list[dict] = []
     for place, entries, how in raw:
         where: Location = how["where"]
+        pin: EntrancePin | None = how.get("pin")
         numbers: list[int] = []
         for entry in entries:
             bosses.append(
@@ -1536,6 +1595,9 @@ def derive(
             "z": [index[era_input.areas[zone]] for zone in place["zones"]] if place.get("zones") else None,
             "ez": index[where.zone] if where.zone else None,
             "ec": index[where.continent] if where.continent else None,
+            "eu": pin.ui_map if pin else None,
+            "ex": pin.x if pin else None,
+            "ey": pin.y if pin else None,
             "sz": place.get("sz"),
             "g": place.get("g"),
             "b": numbers,
@@ -1556,6 +1618,7 @@ def derive(
                 "zone": where.zone,
                 "continent": where.continent,
                 "whereFrom": where.source,
+                "entrance": (pin.ui_map, pin.x, pin.y) if pin else None,
             }
         )
     bosses = [{key: value for key, value in boss.items() if value is not None} for boss in bosses]
@@ -1581,6 +1644,7 @@ def derive(
         "strings": len(table),
         "withZone": sum(1 for p in places if "ez" in p),
         "withContinent": sum(1 for p in places if "ec" in p),
+        "withEntrance": sum(1 for p in places if "eu" in p),
         "cacheFiles": facts.cache_files,
         **stage.named,
     }
@@ -1642,6 +1706,8 @@ def header_lines(table: BossLoot) -> list[str]:
         f"band is read from (1 to {MAX_PLAYER_LEVEL}), lo/hi the level range, m Map id, a the area "
         "id EraSources uses, an the AreaTable name where it differs from n, z (k=3) the zones, "
         "ez the entrance zone's name (absent for k=3), ec the continent's name, "
+        "eu/ex/ey the entrance pin (the zone UiMapID, and x from the left and y from the top in "
+        f"tenths of a percent, 0 to {ENTRANCE_SCALE}; all three or none), "
         "sz players, g 1 = new in Forever, b = {indices into b, in draw order} }. Places are in "
         "draw order: band (ceil(lv / 10), no lv last), then lv, then k, then name.",
         "b = { n name, r rank (1 boss, 2 rare elite, 3 rare, 4 chest), lo/hi creature levels, "
@@ -1674,8 +1740,8 @@ def header_lines(table: BossLoot) -> list[str]:
 
 def location_lines(table: BossLoot) -> list[str]:
     """The compile's report of where each place is (brief BL13a): one line per place with the
-    source its ez and ec came from, then the count per source, then the Era instances that did
-    not resolve both, by name."""
+    source its ez and ec came from (and its entrance pin, brief W16), then the count per source,
+    then the Era instances that did not resolve both, by name, then the places with no pin."""
     names = {WHERE_UI_MAP: "a", WHERE_ENTRANCE: "b", WHERE_AREA: "c", WHERE_NONE: "none"}
     lines: list[str] = []
     tally: dict[str, int] = defaultdict(int)
@@ -1686,12 +1752,15 @@ def location_lines(table: BossLoot) -> list[str]:
         lines.append(
             f"{source:<4} {note['name']}: {note['zone'] or '-'}, {note['continent'] or '-'}"
             + (", new" if note["new"] else "")
+            + (" (entrance {1} {2} on UiMap {0})".format(*note["entrance"]) if note.get("entrance") else "")
         )
         if note["kind"] != KIND_WORLD_BOSS and not note["new"] and not (note["zone"] and note["continent"]):
             unresolved.append(note["name"])
     summary = ", ".join(f"{source} {tally[source]}" for source in ("a", "b", "c", "none"))
     lines.append(f"by source: {summary}")
     lines.append(f"Era instances not fully placed: {', '.join(unresolved) if unresolved else 'none'}")
+    pinless = [n["name"] for n in table.notes if n["kind"] != KIND_WORLD_BOSS and not n.get("entrance")]
+    lines.append(f"places with no entrance pin: {', '.join(pinless) if pinless else 'none'}")
     return lines
 
 
