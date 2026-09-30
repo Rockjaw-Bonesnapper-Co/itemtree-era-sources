@@ -85,10 +85,12 @@ CONTINENT_MAPS = frozenset({0, 1})
 NOTABLE_QUALITY = 3
 # Places are read at player levels, so every place level is clamped to this.
 MAX_PLAYER_LEVEL = 60
-# The band a place is drawn under: ceil(lv / 10), 1 to 6, and 7 for no level at all.
+# The band a place is drawn under: ceil(lv / 10), 1 to 6; 7, "Endgame (60+)", for a place
+# entered at level 60 and for every world boss whatever its level (brief W23); 8 for no level.
 BAND_WIDTH = 10
 BAND_COUNT = 6
-BAND_UNKNOWN = BAND_COUNT + 1
+BAND_ENDGAME = BAND_COUNT + 1
+BAND_UNKNOWN = BAND_COUNT + 2
 # instance_encounters.creditType 0: the credit is a creature kill.
 CREDIT_KILL = 0
 # The UiMap types the location chain reads, as the client's Enum.UIMapType names them: a
@@ -254,8 +256,11 @@ def type_code(class_id: int, subclass_id: int, inventory_type: int) -> int:
     return by_class.get(class_id, TYPE_OTHER)
 
 
-def band(level: int | None) -> int:
-    """The band a place is listed under: 1 to 6 by tens of levels, and 7 for no level."""
+def band(level: int | None, kind: int | None = None) -> int:
+    """The band a place is listed under: 1 to 6 by tens of levels, 7 (endgame) for an entry
+    level of 60 or any world boss, and 8 for no level."""
+    if kind == KIND_WORLD_BOSS or (level and level >= MAX_PLAYER_LEVEL):
+        return BAND_ENDGAME
     if not level:
         return BAND_UNKNOWN
     return min(BAND_COUNT, max(1, math.ceil(level / BAND_WIDTH)))
@@ -1660,7 +1665,12 @@ def derive(
             )
 
     raw.sort(
-        key=lambda item: (band(item[0]["lv"]), item[0]["lv"] or 0, item[0]["k"], item[0]["name"].lower())
+        key=lambda item: (
+            band(item[0]["lv"], item[0]["k"]),
+            item[0]["lv"] or 0,
+            item[0]["k"],
+            item[0]["name"].lower(),
+        )
     )
 
     strings: set[str] = set()
@@ -1727,7 +1737,7 @@ def derive(
         notes.append(
             {
                 "name": place["name"],
-                "band": band(place["lv"]),
+                "band": band(place["lv"], place["k"]),
                 "kind": place["k"],
                 "lv": place["lv"],
                 "lo": place["lo"],
@@ -1851,7 +1861,8 @@ def header_lines(table: BossLoot) -> list[str]:
         "mu/mx/my the outdoor mouth players look for, where it is hand checked (the same shape "
         "as eu/ex/ey; all three or none; either set may be there without the other), "
         "sz players, g 1 = new in Forever, b = {indices into b, in draw order} }. Places are in "
-        "draw order: band (ceil(lv / 10), no lv last), then lv, then k, then name.",
+        "draw order: band (ceil(lv / 10), 1 to 6; 7 endgame, lv 60 or k=3; 8 no lv), then lv, then k, "
+        "then name.",
         "b = { n name, r rank (1 boss, 2 rare elite, 3 rare, 4 chest), lo/hi creature levels, "
         "e the EraSources s index of the name (opens npc: .. -e), cd the CreatureDisplayInfo id of the "
         "first creature in c this build has a model for, ct its CreatureType, c creature ids, "
