@@ -522,6 +522,21 @@ PIN_TENTHS = 10
 # agreed. pfQuest is a CHECK and nothing else: no pfQuest coordinate is shipped.
 PIN_AGREEMENT = 0.5
 
+# Brief W20: which zone a spawn is in when its point lies inside two or more of its creature's
+# zone boxes. See _choose_zone and docs/era-sources.md, "When a point is inside two zone boxes".
+# A cmangos spawn and a pfQuest point of the same id this close (yards, on either world axis) are
+# the same spawn. Where pfQuest states one spawn in two areas it is as a copy within about ten
+# yards of the first (the two maps' corners differ a little), and the next nearest point of the
+# same id in another area is usually a hundred yards or more away.
+PIN_MATCH_YARDS = 20.0
+# The smaller of two zone boxes wins only where it is at most this fraction of the next smallest:
+# a town or a zone inside a far bigger neighbour's box. Two neighbours of about one size (Alterac
+# Mountains and Hillsbrad Foothills) say nothing by size, and the rule before brief W20 stands.
+PIN_SMALLER_SHARE = 0.5
+# The canvas a zone map's WorldMapOverlay hit rectangles are measured on, in pixels: every
+# overlay row on 1.60.1.70009 ends inside 1002 by 669.
+WORLD_MAP_CANVAS = (1002.0, 668.0)
+
 # The UiMap types a pin is drawn on, named as the client's Enum.UIMapType names them
 # (Blizzard_APIDocumentationGenerated/MapConstantsDocumentation.lua, Forever branch of the
 # wow-ui-source mirror). Type 3 is Zone. Type 6 is Orphan, a map with its own art that the
@@ -820,6 +835,25 @@ class MapBounds:
 
 
 @dataclass(frozen=True)
+class MapArt:
+    """Brief W20: one `WorldMapOverlay` row, the piece of a zone map's art that lights up when a
+    subzone is explored: its hit rectangle on WORLD_MAP_CANVAS and the areas it names (one on
+    all but a handful of rows). Read to tell which of two overlapping zone boxes a point is in."""
+
+    left: float
+    top: float
+    right: float
+    bottom: float
+    areas: tuple[int, ...]
+
+    def holds(self, x: float, y: float) -> bool:
+        """Whether a map percentage lies inside the hit rectangle."""
+        px = x / 100.0 * WORLD_MAP_CANVAS[0]
+        py = y / 100.0 * WORLD_MAP_CANVAS[1]
+        return self.left <= px <= self.right and self.top <= py <= self.bottom
+
+
+@dataclass(frozen=True)
 class MapPin:
     """One shipped pin: a place on one zone map, as a percentage of it.
 
@@ -923,6 +957,10 @@ class EraInput:
     area_maps: dict[int, int] = field(default_factory=dict)
     # (uiMapId, continent mapId) -> that zone map's world bounds.
     map_bounds: dict[tuple[int, int], MapBounds] = field(default_factory=dict)
+    # Brief W20: uiMapId -> the explored subzone art drawn on that map (map_overlays), and the
+    # areas this build flags as a capital city (capital_areas).
+    map_art: dict[int, tuple[MapArt, ...]] = field(default_factory=dict)
+    capital_areas: set[int] = field(default_factory=set)
     # mapId -> the area THIS build gives the whole of that instance map, for every instance map
     # it names one for. A creature whose spawns are all on one such map lives inside that
     # instance and takes this as its area, because no open world area is true of it.
@@ -1018,6 +1056,13 @@ class EraSources:
     quest_requires: dict[int, str] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
+    # Brief W20, for the compile report and never shipped: shipped pins and path points inside
+    # two zones' boxes, by pair of zones then kind (zone_overlaps), and every name a point in two
+    # boxes now
+    # places in another zone than the rule before W20 did, as (what, name, zone before, zone now,
+    # spawns) (zone_moves).
+    zone_overlaps: dict[str, dict[str, int]] = field(default_factory=dict)
+    zone_moves: list[tuple[str, str, str, str, int]] = field(default_factory=list)
 
     def module_value(self, generated: str | None = None) -> dict:
         """The module table. `generated` is the compile's stamp, the same one the header prints.
@@ -1786,6 +1831,49 @@ def map_bounds(conn: sqlite3.Connection, build: str) -> dict[tuple[int, int], Ma
     if not out:
         raise EraSourcesError(f"build {build} has no zone level UiMapAssignment rows to place a pin in")
     return out
+
+
+def map_overlays(conn: sqlite3.Connection, build: str) -> dict[int, tuple[MapArt, ...]]:
+    """Brief W20: zone UiMap id -> its `WorldMapOverlay` pieces (joined through `UiMapXMapArt`),
+    each a hit rectangle and the areas it names. Empty where the build's table has no hit
+    rectangle columns, and then the tie break skips the step that reads them."""
+    try:
+        rows = conn.execute(
+            "SELECT x.UiMapID AS ui_map, o.HitRectLeft AS l, o.HitRectTop AS t, o.HitRectRight AS r, "
+            "o.HitRectBottom AS b, o.AreaID_0 AS a0, o.AreaID_1 AS a1, o.AreaID_2 AS a2, o.AreaID_3 AS a3 "
+            "FROM WorldMapOverlay o JOIN UiMapXMapArt x "
+            "ON x.UiMapArtID = o.UiMapArtID AND x.build_id = o.build_id "
+            "WHERE o.build_id = ? ORDER BY x.UiMapID, o.ID",
+            (build,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    out: dict[int, list[MapArt]] = defaultdict(list)
+    for row in rows:
+        areas = tuple(int(row[key] or 0) for key in ("a0", "a1", "a2", "a3") if int(row[key] or 0))
+        right, bottom = _num(row["r"]), _num(row["b"])
+        if not areas or right <= 0 or bottom <= 0:
+            continue
+        art = MapArt(left=_num(row["l"]), top=_num(row["t"]), right=right, bottom=bottom, areas=areas)
+        if art not in out[int(row["ui_map"] or 0)]:
+            out[int(row["ui_map"] or 0)].append(art)
+    return {ui_map: tuple(pieces) for ui_map, pieces in sorted(out.items())}
+
+
+# AreaTable.Flags_0 bit 0x100, the client's capital city flag. On 1.60.1.70009 it is set on the
+# six capitals (Stormwind City 1519, Ironforge 1537, Darnassus 1657, Orgrimmar 1637, Thunder
+# Bluff 1638, Undercity 1497), a second Stormwind City (16509) and Stormwind Harbor, and nowhere else.
+AREA_FLAG_CAPITAL = 0x100
+
+
+def capital_areas(conn: sqlite3.Connection, build: str) -> set[int]:
+    """Brief W20: the areas this build's own AreaTable flags as a capital city (AREA_FLAG_CAPITAL).
+    Empty where the loaded table has no Flags_0 column, and then no area counts as one."""
+    try:
+        rows = conn.execute("SELECT ID, Flags_0 FROM AreaTable WHERE build_id = ?", (build,)).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {int(row["ID"]) for row in rows if int(row["Flags_0"] or 0) & AREA_FLAG_CAPITAL}
 
 
 def area_maps(conn: sqlite3.Connection, build: str, areas: Mapping[int, str]) -> dict[int, int]:
@@ -2998,45 +3086,207 @@ def _spawns_by_creature(
     return by_creature, event_only, nameless
 
 
-def _pin_area(
+def world_position(bounds: MapBounds, x: float, y: float) -> tuple[float, float]:
+    """map_position backwards: a zone map percentage as a world position (world x, world y)."""
+    across = (x / 100.0 - bounds.ui_min_x) / (bounds.ui_max_x - bounds.ui_min_x)
+    down = (y / 100.0 - bounds.ui_min_y) / (bounds.ui_max_y - bounds.ui_min_y)
+    return (
+        bounds.max_x - down * (bounds.max_x - bounds.min_x),
+        bounds.max_y - across * (bounds.max_y - bounds.min_y),
+    )
+
+
+def box_size(bounds: MapBounds) -> float:
+    """How much of the world a zone box covers, in square yards."""
+    return (bounds.max_x - bounds.min_x) * (bounds.max_y - bounds.min_y)
+
+
+@dataclass(frozen=True)
+class _Held:
+    """One candidate area whose zone box holds a spawn, and where on that area's map."""
+
+    area: int
+    x: float
+    y: float
+    box: MapBounds
+
+
+def _stated_gap(held: _Held, points: Mapping[int, Sequence[SpawnPoint]]) -> float:
+    """How far, in map percent on either axis, the spawn sits from the nearest pfQuest point of
+    the same id pfQuest states in the held area (infinity where it states none there)."""
+    return min(
+        (max(abs(point.x - held.x), abs(point.y - held.y)) for point in points.get(held.area, ())),
+        default=float("inf"),
+    )
+
+
+def _stated_yards(held: _Held, points: Mapping[int, Sequence[SpawnPoint]]) -> float:
+    """_stated_gap in yards on the held area's own map, so two areas' answers compare."""
+    box = held.box
+    wide = (box.max_y - box.min_y) / (box.ui_max_x - box.ui_min_x) / 100.0
+    tall = (box.max_x - box.min_x) / (box.ui_max_y - box.ui_min_y) / 100.0
+    return min(
+        (
+            max(abs(point.x - held.x) * wide, abs(point.y - held.y) * tall)
+            for point in points.get(held.area, ())
+        ),
+        default=float("inf"),
+    )
+
+
+def _nearest_stated(held: Sequence[_Held], points: Mapping[int, Sequence[SpawnPoint]]) -> _Held:
+    """The rule before brief W20, and now its last resort: the held area whose nearest pfQuest
+    point of the same id is nearest in map percent, the commonest area first on a tie."""
+    best = held[0]
+    best_gap = _stated_gap(best, points)
+    for candidate in held[1:]:
+        gap = _stated_gap(candidate, points)
+        if gap < best_gap:
+            best, best_gap = candidate, gap
+    return best
+
+
+def _drawn_areas(
+    pool: Sequence[_Held], art: Mapping[int, Sequence[MapArt]], area_maps: Mapping[int, int]
+) -> set[int]:
+    """The areas of `pool` this build's own map art names at the point: each explored subzone
+    piece on any pool area's map whose hit rectangle holds the point names its areas, and a named
+    area counts for the pool area it is, or whose map it is drawn on (a subzone for its zone, and
+    a city piece on the zone map for the city)."""
+    named: set[int] = set()
+    for candidate in pool:
+        for piece in art.get(candidate.box.ui_map, ()):
+            if not piece.holds(candidate.x, candidate.y):
+                continue
+            for area in piece.areas:
+                for other in pool:
+                    if area == other.area or area_maps.get(area) == other.box.ui_map:
+                        named.add(other.area)
+    return named
+
+
+def _choose_zone(
+    held: Sequence[_Held],
+    points: Mapping[int, Sequence[SpawnPoint]],
+    art: Mapping[int, Sequence[MapArt]] | None = None,
+    area_maps: Mapping[int, int] | None = None,
+    capitals: Collection[int] = (),
+) -> tuple[_Held, str]:
+    """Brief W20: which of two or more held areas a point is in, and which step said so.
+
+      own      the id's own pfQuest point for this spawn (within PIN_MATCH_YARDS) is stated in
+               exactly one of the held areas: the creature's own data names the zone;
+      art      else, among the areas that point is stated in (all held areas where it is in
+               none), the build's own explored subzone art names exactly one (_drawn_areas);
+      smaller  else, the capital cities (`capitals`) set aside, the one area left, or the one
+               whose zone box is at most PIN_SMALLER_SHARE of the next smallest;
+      nearest  else the rule before brief W20 (_nearest_stated) over the same areas, the
+               capitals still set aside unless every one of them is a capital.
+
+    A capital is chosen only by its own point or by the art: its box is a small one inside a big
+    zone's, so the size step would pull every nearby wilderness spawn (the Flatland Prowlers at
+    the foot of Thunder Bluff) into the city.
+
+    CMaNGOS states no zone or area for a spawn at all (its `creature` and `gameobject` rows carry
+    a map and a position only), so every step reads pfQuest or this build's own tables. pfQuest
+    states a spawn in every area whose map it shows on, which is why step one so often names
+    two: Lord Kazzak's one spawn is stated in Blasted Lands and Stranglethorn Vale both, and it
+    is the Blasted Lands map's own "The Tainted Scar" piece that holds him.
+    """
+    matched = [candidate for candidate in held if _stated_yards(candidate, points) <= PIN_MATCH_YARDS]
+    if len(matched) == 1:
+        return matched[0], "own"
+    pool = matched or list(held)
+    drawn = _drawn_areas(pool, art or {}, area_maps or {})
+    if len(drawn) == 1:
+        return next(candidate for candidate in pool if candidate.area in drawn), "art"
+    open_world = [
+        candidate for candidate in pool if candidate.area not in capitals or candidate in matched
+    ] or pool
+    if len(open_world) == 1:
+        return open_world[0], "smaller"
+    ranked = sorted(open_world, key=lambda candidate: box_size(candidate.box))
+    if box_size(ranked[0].box) <= PIN_SMALLER_SHARE * box_size(ranked[1].box):
+        return ranked[0], "smaller"
+    return _nearest_stated(open_world, points), "nearest"
+
+
+@dataclass(frozen=True)
+class _PinChoice:
+    """Where one spawn is placed, the area the rule before brief W20 took, and the step that
+    decided ("one" where a single candidate's box holds the spawn)."""
+
+    area: int
+    x: float
+    y: float
+    before: int
+    step: str
+
+
+@dataclass
+class _ZoneWork:
+    """Brief W20: what the three placing passes report. `moves` is (what, name, the area before
+    W20, the area now) -> spawns, where the two differ; `steps` counts which _choose_zone step
+    decided each spawn inside two or more boxes; `shipped` is every shipped pin and path point as
+    (what, area, x, y), for zone_overlaps."""
+
+    moves: Counter[tuple[str, str, int, int]] = field(default_factory=Counter)
+    steps: Counter[str] = field(default_factory=Counter)
+    shipped: list[tuple[str, int, float, float]] = field(default_factory=list)
+
+
+def _pin_choice(
     spawn: Spawn,
     candidates: Sequence[int],
     maps: Mapping[int, int],
     bounds: Mapping[tuple[int, int], MapBounds],
-    points: Mapping[int, list[SpawnPoint]],
-) -> tuple[int, float, float] | None:
-    """Which of a creature's own areas one spawn sits in, and where on that area's map.
-
-    The area comes from the spawn's own area id and never from testing the zone boxes, which
-    overlap badly: 35,476 of the dump's 66,310 positions fall inside two or more of this
-    build's zone assignments. A creature known in one area has every spawn in it. A creature
-    known in several (468 names have two zones, the worst has sixteen) has each spawn matched to
-    the pfQuest spawn it IS, by position on each candidate's own map, and takes that spawn's
-    area id, which is the same number this file has always been read for.
-
-    None where the spawn is on a map the zone has no assignment for, which is every spawn
-    inside an instance, or where the computed position falls outside every candidate's map.
-    Where pfQuest states no position at all for a candidate the commonest area wins, which is
-    what the rest of this stage has always done with the same list.
-    """
-    best: tuple[int, float, float] | None = None
-    best_gap = float("inf")
+    points: Mapping[int, Sequence[SpawnPoint]],
+    art: Mapping[int, Sequence[MapArt]] | None = None,
+    area_maps: Mapping[int, int] | None = None,
+    capitals: Collection[int] = (),
+) -> _PinChoice | None:
+    """_pin_area with its working: see there."""
+    held: list[_Held] = []
     for area in candidates:  # commonest first
         found = bounds.get((maps[area], spawn.map))
         if found is None:
             continue
         x, y = map_position(found, spawn.x, spawn.y)
-        if not (0.0 <= x <= 100.0 and 0.0 <= y <= 100.0):
-            continue
-        if len(candidates) == 1:
-            return (area, x, y)
-        gap = min(
-            (max(abs(point.x - x), abs(point.y - y)) for point in points.get(area, ())),
-            default=float("inf"),
-        )
-        if best is None or gap < best_gap:
-            best, best_gap = (area, x, y), gap
-    return best
+        if 0.0 <= x <= 100.0 and 0.0 <= y <= 100.0:
+            held.append(_Held(area, x, y, found))
+    if not held:
+        return None
+    if len(held) == 1:
+        only = held[0]
+        return _PinChoice(only.area, only.x, only.y, only.area, "one")
+    chosen, step = _choose_zone(held, points, art, area_maps, capitals)
+    return _PinChoice(chosen.area, chosen.x, chosen.y, _nearest_stated(held, points).area, step)
+
+
+def _pin_area(
+    spawn: Spawn,
+    candidates: Sequence[int],
+    maps: Mapping[int, int],
+    bounds: Mapping[tuple[int, int], MapBounds],
+    points: Mapping[int, Sequence[SpawnPoint]],
+    art: Mapping[int, Sequence[MapArt]] | None = None,
+    area_maps: Mapping[int, int] | None = None,
+    capitals: Collection[int] = (),
+) -> tuple[int, float, float] | None:
+    """Which of a creature's own areas one spawn sits in, and where on that area's map.
+
+    The candidates are the areas pfQuest states the id in, and never every zone box on the map:
+    the boxes overlap badly, and 35,476 of the dump's 66,310 positions fall inside two or more of
+    this build's zone assignments. A candidate whose box holds the spawn is kept; where only one
+    does, that is the answer. Where two or more do, _choose_zone decides (brief W20): the id's own
+    pfQuest point for this spawn, then the build's own explored subzone art, then a far smaller
+    box, then the old nearest pfQuest point rule.
+
+    None where the spawn is on a map the zone has no assignment for, which is every spawn
+    inside an instance, or where the computed position falls outside every candidate's map.
+    """
+    found = _pin_choice(spawn, candidates, maps, bounds, points, art, area_maps, capitals)
+    return None if found is None else (found.area, found.x, found.y)
 
 
 @dataclass
@@ -3052,6 +3302,10 @@ class _Placed:
     instance: int = 0
     outside: int = 0
     no_area: int = 0
+    # Brief W20: how many spawns inside two or more candidate boxes each _choose_zone step
+    # decided, and (name, the area before W20, the area now) -> spawns, where the two differ.
+    steps: Counter[str] = field(default_factory=Counter)
+    moves: Counter[tuple[str, int, int]] = field(default_factory=Counter)
 
 
 def _place_spawns(
@@ -3087,14 +3341,27 @@ def _place_spawns(
                 continue
             maps = {area: era_input.area_maps[area] for area in candidates}
             for spawn in spawns:
-                found = _pin_area(spawn, candidates, maps, era_input.map_bounds, points)
-                if found is None:
+                choice = _pin_choice(
+                    spawn,
+                    candidates,
+                    maps,
+                    era_input.map_bounds,
+                    points,
+                    era_input.map_art,
+                    era_input.area_maps,
+                    era_input.capital_areas,
+                )
+                if choice is None:
                     if any(era_input.map_bounds.get((maps[area], spawn.map)) for area in candidates):
                         placed.outside += 1
                     else:
                         placed.instance += 1
                     continue
-                area, x, y = found
+                area, x, y = choice.area, choice.x, choice.y
+                if choice.step != "one":
+                    placed.steps[choice.step] += 1
+                    if choice.before != area:
+                        placed.moves[(name, choice.before, area)] += 1
                 placed.groups[(name, area)].append((x, y))
                 # The cross check, on the real run: how close the formula's own answer sits to
                 # the nearest pfQuest spawn of the same id in the same area. pfQuest is a
@@ -3137,6 +3404,78 @@ def _reduce_placed(
     return ordered, total, shares
 
 
+def _note_zones(zones: _ZoneWork, what: str, placed: _Placed, pins: Mapping[int, Sequence[MapPin]]) -> None:
+    """Add one placing pass's moves, steps and shipped pins to the brief W20 report."""
+    for (name, before, after), spawns in placed.moves.items():
+        zones.moves[(what, name, before, after)] += spawns
+    zones.steps.update(placed.steps)
+    for made in pins.values():
+        zones.shipped.extend((what, pin.area, pin.x, pin.y) for pin in made)
+
+
+def zone_overlaps(
+    shipped: Sequence[tuple[str, int, float, float]],
+    area_maps: Mapping[int, int],
+    map_bounds: Mapping[tuple[int, int], MapBounds],
+    areas: Mapping[int, str],
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    """Brief W20: how many shipped pins and path points sit inside two or more zone boxes.
+
+    Returns (what -> how many points of that kind sit in two or more boxes, "A + B" -> what ->
+    how many of them sit in both A's and B's box), `what` being "pins", "object pins" or "path
+    points"; a point in three boxes counts once under each of its three pairs. Every zone box this
+    build has on the point's world map is tested, not only its creature's candidates. A box is
+    named by the area most of the shipped points drawn on it carry (ties by the lower id), which
+    is the zone's own name wherever the zone has any, else by the lowest area id drawn on it.
+    """
+    by_ui: dict[int, list[MapBounds]] = defaultdict(list)
+    by_map: dict[int, list[MapBounds]] = defaultdict(list)
+    for key in sorted(map_bounds):
+        by_ui[key[0]].append(map_bounds[key])
+        by_map[key[1]].append(map_bounds[key])
+    carried: dict[int, Counter[int]] = defaultdict(Counter)
+    for area in sorted(area_maps):
+        carried[area_maps[area]][area] += 0
+    for _what, area, _x, _y in shipped:
+        carried[area_maps.get(area, 0)][area] += 1
+    names = {
+        ui_map: areas.get(min(tally.items(), key=lambda pair: (-pair[1], pair[0]))[0], str(ui_map))
+        for ui_map, tally in carried.items()
+        if tally
+    }
+    totals: Counter[str] = Counter()
+    pairs: dict[str, Counter[str]] = defaultdict(Counter)
+    for what, area, x, y in shipped:
+        own = by_ui.get(area_maps.get(area, 0))
+        if not own:
+            continue
+        world_x, world_y = world_position(own[0], x, y)
+        holders = set()
+        for box in by_map[own[0].map]:
+            bx, by = map_position(box, world_x, world_y)
+            if 0.0 <= bx <= 100.0 and 0.0 <= by <= 100.0:
+                holders.add(names.get(box.ui_map, str(box.ui_map)))
+        if len(holders) < 2:
+            continue
+        totals[what] += 1
+        ordered = sorted(holders)
+        for i, first in enumerate(ordered):
+            for second in ordered[i + 1 :]:
+                pairs[f"{first} + {second}"][what] += 1
+    ranked = sorted(pairs.items(), key=lambda pair: (-sum(pair[1].values()), pair[0]))
+    return dict(totals), {pair: dict(sorted(by_what.items())) for pair, by_what in ranked}
+
+
+def zone_moves(
+    moves: Mapping[tuple[str, str, int, int], int], areas: Mapping[int, str]
+) -> list[tuple[str, str, str, str, int]]:
+    """Brief W20's moves as (what, name, zone before, zone now, spawns), sorted for reading."""
+    return sorted(
+        (what, name, areas.get(before, str(before)), areas.get(after, str(after)), spawns)
+        for (what, name, before, after), spawns in moves.items()
+    )
+
+
 def _creature_pins(
     era_input: EraInput,
     names: set[str],
@@ -3144,6 +3483,7 @@ def _creature_pins(
     used_areas: dict[int, int],
     counts: dict[str, int],
     dropped: dict[str, int],
+    zones: _ZoneWork | None = None,
 ) -> dict[int, tuple[MapPin, ...]]:
     """A creature name's index into `s` -> its map pins, in the order the addon draws them.
 
@@ -3166,8 +3506,10 @@ def _creature_pins(
         if facts.name in names:
             by_name[facts.name].append(creature)
 
+    zones = zones if zones is not None else _ZoneWork()
     placed = _place_spawns(era_input, by_name, by_creature, era_input.unit_zones, era_input.unit_points)
     pins, total, shares = _reduce_placed(placed, era_input, strings, used_areas)
+    _note_zones(zones, "pins", placed, pins)
 
     dropped["pinInsideInstance"] = placed.instance
     dropped["pinOutsideMap"] = placed.outside
@@ -3279,6 +3621,7 @@ def _creature_paths(
     used_areas: dict[int, int],
     counts: dict[str, int],
     dropped: dict[str, int],
+    zones: _ZoneWork | None = None,
 ) -> dict[int, list[str]]:
     """Brief W18: a boss name's index into `s` -> the paths it walks, packed by pack_path.
 
@@ -3286,11 +3629,14 @@ def _creature_paths(
     walks (spawn_walk) has its path drawn on the zone map of the spawn's own pin area, found by
     the very rule the pins use (_pin_area), so the path and the pin are on one map. A creature
     with no `creature` row at all (a script spawn: Maws, the four dragons) walks its template
-    path; the dump states no map for one, so it is drawn on the first of the creature's own
-    pfQuest areas whose zone map holds every point of it, then the first of the areas of every
-    other spawnless creature that walks exactly the same path (the dragons share one). A path
-    none of those holds, or with fewer than PATH_MIN_POINTS points on its map, is not shipped.
+    path; the dump states no map for one, so it is drawn on one of the creature's own pfQuest
+    areas whose zone map holds every point of it, or failing those one of the areas of every other
+    spawnless creature that walks exactly the same path (the dragons share one). Where two or more
+    of the same list hold it, _choose_zone picks, at the path's first point, as it does for a pin
+    (brief W20). A path none of those holds, or with fewer than PATH_MIN_POINTS points on its map,
+    is not shipped.
     """
+    zones = zones if zones is not None else _ZoneWork()
     by_creature, _event_only, _nameless = _spawns_by_creature(era_input.spawns, era_input.spawn_entries)
     listed = listed_creatures(era_input)
     walkers = _unspawned_walkers(era_input, listed)
@@ -3325,11 +3671,22 @@ def _creature_paths(
                     continue
                 where = None
                 if candidates:
-                    where = _pin_area(spawn, candidates, maps, era_input.map_bounds, stated)
+                    where = _pin_choice(
+                        spawn,
+                        candidates,
+                        maps,
+                        era_input.map_bounds,
+                        stated,
+                        era_input.map_art,
+                        era_input.area_maps,
+                        era_input.capital_areas,
+                    )
                 if where is None:
                     not_placed += 1
                     continue
-                found.append((where[0], era_input.map_bounds[(maps[where[0]], spawn.map)], walk))
+                if where.before != where.area:
+                    zones.moves[("paths", facts.name, where.before, where.area)] += 1
+                found.append((where.area, era_input.map_bounds[(maps[where.area], spawn.map)], walk))
         elif creature in listed:
             # Every row it has is event only, so it is not found at all, as its pins say.
             continue
@@ -3337,23 +3694,42 @@ def _creature_paths(
             walk = template_walk(era_input, creature)
             if not walk:
                 continue
-            shared = list(candidates)
+            others: list[int] = []
             for other in walkers.get(walk, ()):
                 if other != creature:
-                    shared.extend(area for area in _zone_candidates(era_input, other) if area not in shared)
-            chosen = next(
-                (
-                    (area, box)
-                    for area in shared
-                    for box in boxes.get(era_input.area_maps[area], ())
-                    if holds(box, walk)
-                ),
-                None,
-            )
+                    others.extend(
+                        area
+                        for area in _zone_candidates(era_input, other)
+                        if area not in candidates and area not in others
+                    )
+            chosen = None
+            for shared in (candidates, others):
+                held = []
+                for area in shared:
+                    box = next(
+                        (box for box in boxes.get(era_input.area_maps[area], ()) if holds(box, walk)), None
+                    )
+                    if box is not None:
+                        x, y = map_position(box, walk[0][0], walk[0][1])
+                        held.append(_Held(area, x, y, box))
+                if not held:
+                    continue
+                chosen = held[0]
+                if len(held) > 1:
+                    own_points: dict[int, list[SpawnPoint]] = defaultdict(list)
+                    for point in era_input.unit_points.get(creature, ()):
+                        own_points[point.area].append(point)
+                    chosen, step = _choose_zone(
+                        held, own_points, era_input.map_art, era_input.area_maps, era_input.capital_areas
+                    )
+                    zones.steps[step] += 1
+                    if chosen.area != held[0].area:
+                        zones.moves[("paths", facts.name, held[0].area, chosen.area)] += 1
+                break
             if chosen is None:
                 not_placed += 1
                 continue
-            found.append((chosen[0], chosen[1], walk))
+            found.append((chosen.area, chosen.box, walk))
         for area, box, walk in found:
             on_map, missed = place_path(box, walk)
             off_map += missed
@@ -3367,6 +3743,7 @@ def _creature_paths(
             if packed not in out[index]:
                 out[index].add(packed)
                 points_shipped += len(kept)
+                zones.shipped.extend(("path points", area, x, y) for x, y in kept)
             used_areas[area] = strings.add(era_input.areas[area])
     counts["pathNames"] = len(out)
     counts["paths"] = sum(len(walks) for walks in out.values())
@@ -3389,6 +3766,7 @@ def _object_pins(
     used_areas: dict[int, int],
     counts: dict[str, int],
     dropped: dict[str, int],
+    zones: _ZoneWork | None = None,
 ) -> dict[int, tuple[MapPin, ...]]:
     """An OBJECT name's index into `s` -> its map pins (brief D7), by exactly the creature rule.
 
@@ -3410,8 +3788,10 @@ def _object_pins(
         if obj.name in names and _lootable(obj) and not is_scaffolding(obj.name):
             by_name[obj.name].append(oid)
 
+    zones = zones if zones is not None else _ZoneWork()
     placed = _place_spawns(era_input, by_name, by_object, era_input.object_zones, era_input.object_points)
     pins, total, _shares = _reduce_placed(placed, era_input, strings, used_areas)
+    _note_zones(zones, "object pins", placed, pins)
 
     dropped["objectPinInsideInstance"] = placed.instance
     dropped["objectPinOutsideMap"] = placed.outside
@@ -3898,9 +4278,11 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     trainers = {strings.add(name): spells for name, spells in trainer_lists.items()}
     # The pins go last, because a pin's own area is an area the player can now read and so has to
     # reach `z` and `s` before the string table is sorted.
-    pins = _creature_pins(era_input, npc_names, strings, used_areas, counts, dropped)
+    # Brief W20: what the three placing passes report about overlapping zone boxes.
+    zones = _ZoneWork()
+    pins = _creature_pins(era_input, npc_names, strings, used_areas, counts, dropped, zones)
     # Brief W18: a boss's paths, after the pins for the same reason: a path's area reaches `z`.
-    paths = _creature_paths(era_input, npc_names, strings, used_areas, counts, dropped)
+    paths = _creature_paths(era_input, npc_names, strings, used_areas, counts, dropped, zones)
     counts["vendorNames"] = len(vendor_names)
     counts["vendorNamesSharedWithCreature"] = len(vendor_names & creature_names)
     counts["vendorKinds"] = sum(1 for packed in kinds.values() if packed < 0)
@@ -3922,7 +4304,19 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # `op` rather than in `mp`: `s` is one string table, and a name can be a creature's and an
     # object's both, so one table keyed by name could not say whose pins it holds.
     object_names = _object_names(entries, leftovers, strings)
-    object_pins = _object_pins(era_input, object_names, strings, used_areas, counts, dropped)
+    object_pins = _object_pins(era_input, object_names, strings, used_areas, counts, dropped, zones)
+    overlapping, overlaps = zone_overlaps(
+        zones.shipped, era_input.area_maps, era_input.map_bounds, era_input.areas
+    )
+    moved = zone_moves(zones.moves, era_input.areas)
+    for step in ("own", "art", "smaller", "nearest"):
+        counts[f"zoneBy{step.capitalize()}"] = zones.steps[step]
+    counts["zoneSpawnsInTwoBoxes"] = sum(zones.steps.values())
+    counts["zoneSpawnsMoved"] = sum(row[4] for row in moved)
+    counts["zoneNamesMoved"] = len({row[1] for row in moved})
+    for what in ("pins", "object pins", "path points"):
+        key = "zoneOverlap" + "".join(word.capitalize() for word in what.split())
+        counts[key] = overlapping.get(what, 0)
     counts["objectPinNamesSharedWithCreature"] = sum(
         1 for index in object_pins if strings.value(index) in creature_names
     )
@@ -4083,6 +4477,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         lists=lists,
         counts=counts,
         dropped=dropped,
+        zone_overlaps=overlaps,
+        zone_moves=moved,
     )
 
 
@@ -4326,6 +4722,8 @@ def gather_input(
     era_input.display_ids = build_display_ids(conn, build)
     era_input.area_maps = area_maps(conn, build, era_input.areas)
     era_input.map_bounds = map_bounds(conn, build)
+    era_input.map_art = map_overlays(conn, build)
+    era_input.capital_areas = capital_areas(conn, build)
     era_input.instance_areas = instance_areas(conn, build, era_input.areas)
     era_input.faction_sides = read_faction_sides(conn, build)
     era_input.skill_spells = read_skill_spells(conn, build)
