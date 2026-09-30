@@ -526,6 +526,22 @@ class MouthRow:
 
 
 @dataclass(frozen=True)
+class SpotRow:
+    """One row of curated/world_boss_spots.json that passed its checks (brief W19): a spot on a
+    zone map where any of `creatures` can appear, for a world boss the database spawns by script
+    and places nowhere near it. The position is in tenths of a percent, as a pin's is."""
+
+    creatures: tuple[int, ...]
+    ui_map: int
+    x: int
+    y: int
+    name: str = ""
+    # Whether the owner has stood on the spot in game. The row ships either way; the compile
+    # report marks an unverified one so the pin is checked in the QA build.
+    verified: bool = False
+
+
+@dataclass(frozen=True)
 class KillCriterion:
     """One `Criteria` row of Type 0 (kill a creature, `Asset` the creature id) with the
     `Description_lang` of each `CriteriaTree` row that holds it (`texts`) and of each such
@@ -569,6 +585,8 @@ class BossLootInput:
     curated_bosses: dict[int, NewBossRow] = field(default_factory=dict)
     # curated/instance_mouths.json, every row checked (brief W17): Map id -> the mouth.
     mouths: dict[int, MouthRow] = field(default_factory=dict)
+    # curated/world_boss_spots.json, every row checked (brief W19), in the file's order.
+    spots: tuple[SpotRow, ...] = ()
     # Every cache file left out, cache disagreement and curated row refused, for the summary.
     notes: list[str] = field(default_factory=list)
 
@@ -1540,6 +1558,12 @@ def derive(
             "po": 1 if any(cid in stage.shared for cid in entry.creatures) else None,
             "pins": len(pin_areas),
             "paths": len(path_areas),
+            # Brief W19: the hand kept spots naming this boss, for the report only.
+            "spots": [
+                (spot.ui_map, spot.x, spot.y, spot.verified)
+                for spot in facts.spots
+                if set(spot.creatures) & set(entry.creatures)
+            ],
         }
         # A world boss's zones already say where it is: ez stays absent, ec is the continent
         # they share, from this build's AreaTable (source c).
@@ -1591,6 +1615,21 @@ def derive(
         if map_id not in shipped:
             raise BossLootError(
                 f"{MOUTHS_FILE}: the row for map {map_id} names no place in the index; fix or remove the row"
+            )
+    # Brief W19: a spot names creatures of world bosses in the index, every one of them.
+    world = {
+        cid
+        for place, entries, _how in raw
+        if place["k"] == KIND_WORLD_BOSS
+        for e in entries
+        for cid in e.creatures
+    }
+    for number, spot in enumerate(facts.spots, start=1):
+        stray = [cid for cid in spot.creatures if cid not in world]
+        if stray:
+            raise BossLootError(
+                f"{SPOTS_FILE} row {number} ({spot.name or 'unnamed'}): creature {stray[0]} is no world "
+                "boss in the index; fix or remove the row"
             )
 
     raw.sort(
@@ -1680,6 +1719,8 @@ def derive(
                 "pins": place.get("pins", 0),
                 "paths": place.get("paths", 0),
                 "shared": bool(place.get("po")),
+                # Brief W19, world bosses only: (UiMap, x, y, verified) of each hand kept spot.
+                "spots": place.get("spots", []),
             }
         )
     bosses = [{key: value for key, value in boss.items() if value is not None} for boss in bosses]
@@ -1710,6 +1751,8 @@ def derive(
         "withMouthUnverified": sum(1 for n in notes if n["mouth"] and not n["mouth"][3]),
         "worldBossesShared": sum(1 for p in places if p.get("po")),
         "worldBossesWithPath": sum(1 for n in notes if n["kind"] == KIND_WORLD_BOSS and n["paths"]),
+        "worldBossesWithSpot": sum(1 for n in notes if n["spots"]),
+        "worldBossesWithSpotUnverified": sum(1 for n in notes if any(not s[3] for s in n["spots"])),
         "worldBossesWithNoPosition": sum(
             1 for n in notes if n["kind"] == KIND_WORLD_BOSS and not n["pins"] and not n["paths"]
         ),
@@ -1832,6 +1875,7 @@ def location_lines(table: BossLoot) -> list[str]:
             + (" (entrance {1} {2} on UiMap {0})".format(*note["entrance"]) if note.get("entrance") else "")
             + (_mouth_words(note["mouth"]) if note.get("mouth") else "")
             + (_position_words(note) if note["kind"] == KIND_WORLD_BOSS else "")
+            + "".join(_spot_words(spot) for spot in note.get("spots", ()))
         )
         if note["kind"] != KIND_WORLD_BOSS and not note["new"] and not (note["zone"] and note["continent"]):
             unresolved.append(note["name"])
@@ -1855,6 +1899,13 @@ def _position_words(note: dict) -> str:
     return f" (pins {note.get('pins', 0)}, paths {note.get('paths', 0)}" + (
         ", shared)" if note.get("shared") else ")"
     )
+
+
+def _spot_words(spot: tuple[int, int, int, bool]) -> str:
+    """ " (spot 620 220 on UiMap 1425, unverified)": one hand kept world boss spot (brief W19),
+    marked exactly as an unverified mouth is."""
+    ui_map, x, y, verified = spot
+    return f" (spot {x} {y} on UiMap {ui_map}{'' if verified else ', unverified'})"
 
 
 # ----- reading the client tables and the credits ------------------------------------------------
@@ -2152,6 +2203,127 @@ def read_mouths(
     return validate_mouths(load_mouths(path), maps, ui_maps)
 
 
+SPOTS_FILE = "curated/world_boss_spots.json"
+
+
+def load_spots(path: Path) -> dict:
+    """curated/world_boss_spots.json as read. A file that cannot be read at all fails."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BossLootError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("spots", []), list):
+        raise BossLootError(f"{path} is not a JSON object with a spots list")
+    return raw
+
+
+def validate_spots(
+    raw: dict, ui_maps: Mapping[int, UiMapFacts], creatures: Collection[int]
+) -> tuple[SpotRow, ...]:
+    """Every row of curated/world_boss_spots.json, in the file's order (brief W19). One bad row
+    refuses the whole file (BossLootError, the row named), by the rules of the instance mouths: a
+    row names one or more creatures of the dump (`creatureIds`, each once), a zone UiMap (Type 3)
+    and x, y in percent (0 to 100, as the game shows them), with a provenance, the YYYY-MM-DD the
+    row was written or last reviewed and an optional boolean `verified` (false when absent). The
+    same UiMap and position twice is refused. Neither provenance nor verified is shipped."""
+    rows: list[SpotRow] = []
+    seen: set[tuple[int, int, int]] = set()
+    for index, row in enumerate(raw.get("spots") or [], start=1):
+        name = row.get("name") if isinstance(row, dict) else None
+        what = f"{SPOTS_FILE} row {index} ({name or 'unnamed'})"
+        if not isinstance(row, dict):
+            raise BossLootError(f"{what}: not an object")
+        ids = row.get("creatureIds")
+        if not isinstance(ids, list) or not ids or not all(_positive(cid) for cid in ids):
+            raise BossLootError(f"{what}: creatureIds must be a list of creature ids")
+        if len(set(ids)) != len(ids):
+            raise BossLootError(f"{what}: creatureIds names a creature twice")
+        unknown = [cid for cid in ids if cid not in creatures]
+        if unknown:
+            raise BossLootError(f"{what}: creature {unknown[0]} is not a creature of the dump")
+        ui_map = row.get("uiMap")
+        ui = ui_maps.get(ui_map) if _positive(ui_map) else None
+        if ui is None:
+            raise BossLootError(f"{what}: uiMap {ui_map!r} is not a UiMap of this build")
+        if ui.type != UI_MAP_ZONE:
+            raise BossLootError(f"{what}: uiMap {ui_map} ({ui.name}) is not a zone map (Type {ui.type})")
+        x, y = row.get("x"), row.get("y")
+        if not (_percent_value(x) and _percent_value(y)):
+            raise BossLootError(f"{what}: x {x!r} and y {y!r} must be numbers from 0 to 100")
+        if not isinstance(row.get("provenance"), str) or not row["provenance"]:
+            raise BossLootError(f"{what}: no provenance")
+        if not isinstance(row.get("checked"), str) or not _DATE.match(row["checked"]):
+            raise BossLootError(f"{what}: checked must be a YYYY-MM-DD date")
+        verified = row.get("verified", False)
+        if not isinstance(verified, bool):
+            raise BossLootError(f"{what}: verified must be true or false")
+        tx = max(0, min(ENTRANCE_SCALE, round(x * ENTRANCE_SCALE / 100.0)))
+        ty = max(0, min(ENTRANCE_SCALE, round(y * ENTRANCE_SCALE / 100.0)))
+        if (ui_map, tx, ty) in seen:
+            raise BossLootError(f"{what}: the spot {x}, {y} on uiMap {ui_map} is repeated")
+        seen.add((ui_map, tx, ty))
+        rows.append(SpotRow(tuple(ids), ui_map, tx, ty, name if isinstance(name, str) else "", verified))
+    return tuple(rows)
+
+
+def read_spots(
+    path: Path | None, ui_maps: Mapping[int, UiMapFacts], creatures: Collection[int]
+) -> tuple[SpotRow, ...]:
+    """The checked spots, or none where there is no file: no file, no change."""
+    if path is None or not path.is_file():
+        return ()
+    return validate_spots(load_spots(path), ui_maps, creatures)
+
+
+def spot_area(era_table: era_mod.EraSources, areas: Mapping[int, AreaFacts], ui_map: int) -> int | None:
+    """The area a spot on `ui_map` is pinned in (brief W19): of the areas EraSources names in `z`
+    whose `zm` map is `ui_map`, the zone itself (AreaTable ParentAreaID 0), else the lowest id.
+    None where EraSources draws no area on that map."""
+    found = sorted(
+        area for area, drawn in era_table.area_maps.items() if drawn == ui_map and area in era_table.areas
+    )
+    if not found:
+        return None
+    zones = [area for area in found if area in areas and areas[area].parent == 0]
+    return (zones or found)[0]
+
+
+def apply_spots(era_table: era_mod.EraSources, era_input: era_mod.EraInput, facts: BossLootInput) -> int:
+    """Brief W19: add each hand kept world boss spot to the EraSources pins (`mp`) of every creature
+    its row names, appended after the name's CMaNGOS pins, and count them in `mc` so the file says
+    which records are hand kept. The addon draws a world boss's pins from `mp`, so this is the
+    shape it reads today, and the Boss loot index's zone list takes the spot's area from there (the
+    brief W18 rule). A record the name already carries is not added twice. Called before
+    EraSources is written; no spots, no change. Returns the number of records added. A spot whose
+    map EraSources draws no area on, or whose creature has no name the table ships, refuses the
+    file (BossLootError, the row named)."""
+    if not facts.spots:
+        return 0
+    names = {name: index for index, name in enumerate(era_table.strings, start=1) if index in era_table.kinds}
+    width = era_mod.PIN_AREA_DIGITS + 2 * era_mod.PIN_COORD_DIGITS
+    added: dict[int, list[str]] = {}
+    for number, spot in enumerate(facts.spots, start=1):
+        what = f"{SPOTS_FILE} row {number} ({spot.name or 'unnamed'})"
+        area = spot_area(era_table, facts.areas, spot.ui_map)
+        if area is None:
+            raise BossLootError(f"{what}: EraSources draws no area on uiMap {spot.ui_map}")
+        record = era_mod.pack_pin(area, spot.x / era_mod.PIN_TENTHS, spot.y / era_mod.PIN_TENTHS)
+        for cid in spot.creatures:
+            creature = era_input.creatures.get(cid)
+            index = names.get(creature.name) if creature is not None else None
+            if index is None:
+                raise BossLootError(f"{what}: creature {cid} has no name EraSources ships")
+            held = era_table.pins.get(index, "")
+            records = [held[at : at + width] for at in range(0, len(held), width)]
+            if record in records or record in added.get(index, ()):
+                continue
+            added.setdefault(index, []).append(record)
+    for index, records in added.items():
+        era_table.pins[index] = era_table.pins.get(index, "") + "".join(records)
+        era_table.curated_pins[index] = era_table.curated_pins.get(index, 0) + len(records)
+    return sum(len(records) for records in added.values())
+
+
 def gather_input(
     conn: sqlite3.Connection,
     build: str,
@@ -2161,11 +2333,14 @@ def gather_input(
     creature_caches: Sequence[Path] = (),
     new_bosses_path: Path | None = None,
     mouths_path: Path | None = None,
+    spots_path: Path | None = None,
+    creature_ids: Collection[int] = (),
 ) -> BossLootInput:
     """Read the client tables of both builds and the credits. Everything here is I/O.
     `creature_caches` are the creaturecache.wdb files to read (the client's own first), and
-    `new_bosses_path` is curated/new_bosses.json and `mouths_path` curated/instance_mouths.json,
-    each where it is there."""
+    `new_bosses_path` is curated/new_bosses.json, `mouths_path` curated/instance_mouths.json and
+    `spots_path` curated/world_boss_spots.json, each where it is there; `creature_ids` are the
+    dump's creatures, which a spot's row must name."""
     maps = {
         _int(row["ID"]): MapFacts(
             id=_int(row["ID"]),
@@ -2282,6 +2457,7 @@ def gather_input(
         )
         notes.extend(refused)
     mouths = read_mouths(mouths_path, maps, ui_maps)
+    spots = read_spots(spots_path, ui_maps, creature_ids)
     return BossLootInput(
         maps=maps,
         baseline_maps=baseline_maps,
@@ -2300,5 +2476,6 @@ def gather_input(
         cache_files=len(merged.files_read),
         curated_bosses=curated,
         mouths=mouths,
+        spots=spots,
         notes=notes,
     )

@@ -985,6 +985,11 @@ class EraSources:
     # Brief W18: a creature name's index into `s` -> the paths it walks, each a string packed by
     # pack_path, for a boss (PATH_RANKS) only. See docs/era-sources.md, "Paths".
     paths: dict[int, list[str]] = field(default_factory=dict)
+    # Brief W19: a creature name's index into `s` -> how many records at the END of its `mp`
+    # string are hand kept world boss spawn spots rather than CMaNGOS spawns. Written only by
+    # boss_loot.apply_spots, from curated/world_boss_spots.json; empty without that file, and
+    # then `mc` is not shipped at all. See docs/boss-loot.md, "World boss spots".
+    curated_pins: dict[int, int] = field(default_factory=dict)
     # An object name's index into `s` -> the category its rows are filed under (8 herb, 9 vein,
     # 10 fishing pool, 11 chest), for every name `op` carries.
     object_kinds: dict[int, int] = field(default_factory=dict)
@@ -1033,6 +1038,8 @@ class EraSources:
             "x": dict(self.list_index),
             "xl": list(self.lists),
         }
+        if self.curated_pins:
+            value["mc"] = dict(self.curated_pins)
         if generated:
             value["g"] = generated
         return value
@@ -4094,7 +4101,8 @@ def header_lines(table: EraSources) -> list[str]:
         "cf = { [string index] = side }, tr = { [string index] = packed spell ids }, "
         "qr = { [questId] = packed required items }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
-        "g = the Generated stamp above }",
+        + ("mc = { [string index] = count }, " if table.curated_pins else "")
+        + "g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
         "(c=8, 9) is listed NODE by node: one row per zone the node stands in, a node's zone "
@@ -4167,6 +4175,17 @@ def header_lines(table: EraSources) -> list[str]:
         f"{PIN_CELL:.0f} percent cell of that map, so the pins are a picture of where the "
         "creature is found and not a copy of a spawn table. No spawn count, no respawn timer, "
         "no height. A name with no entry has no pins, which is not an error.",
+        *(
+            [
+                "mc: the names whose mp string ends in hand kept world boss spawn spots, keyed the "
+                "way mp is: the last count records of that name's mp string are a spot a world "
+                "boss the database spawns by script can appear at, kept by hand beside this file, "
+                "and not a CMaNGOS spawn. The same record shape as every other pin. "
+                f"{sum(table.curated_pins.values())} such pins over {len(table.curated_pins)} names.",
+            ]
+            if table.curated_pins
+            else []
+        ),
         "op: where an OBJECT name is found (c=8, 9, 10, 11: a herb, a vein, a fishing pool, a "
         "chest), as map pins in exactly mp's packing and by exactly mp's rule, over the cmangos "
         "gameobject spawns of every chest or fishing hole of that name with loot, each spawn's "
@@ -4233,7 +4252,8 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('withheldItems', 0)} withheld items an earlier build named, whose "
         f"{counts.get('withheldRows', 0)} rows ship so they can show once the client names the "
         "item. The pins in mp and op are the one coordinate this module takes, and they are "
-        "reduced: no spawn table, no respawn timer, no height, and no pfQuest coordinate at all.",
+        "reduced: no spawn table, no respawn timer, no height, and no pfQuest coordinate at all"
+        + (" (the hand kept spots mc marks aside)." if table.curated_pins else "."),
         f"{counts.get('items', 0)} items, {counts.get('rows', 0)} rows ({', '.join(emitted)}), "
         f"{counts.get('rowsWithChance', 0)} with a chance, {counts.get('rowsWithArea', 0)} with "
         f"an area, over {counts.get('strings', 0)} strings and {counts.get('areas', 0)} areas.",
