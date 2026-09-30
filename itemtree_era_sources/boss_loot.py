@@ -574,6 +574,9 @@ class BossLootInput:
     # the client's own file and the testers' files, and how many files were read.
     cached_creatures: dict[int, cache_mod.CachedCreature] = field(default_factory=dict)
     cache_files: int = 0
+    # The creature harvest (brief W21): creatures a creature sweep named, as id -> the name and
+    # display ids in the CachedCreature shape, consulted after the cache.
+    harvest_creatures: dict[int, cache_mod.CachedCreature] = field(default_factory=dict)
     # The build's own encounter models, where a table states them: encounter id -> (display id,
     # creature id or 0), and the source that answered ("" for none).
     client_models: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -765,6 +768,7 @@ class _Stage:
             "modelsByClient": 0,
             "namedByCriteria": 0,
             "namedByCache": 0,
+            "namedByHarvest": 0,
             "namedByCurated": 0,
             "criteriaConflicts": 0,
         }
@@ -851,20 +855,25 @@ class _Stage:
         return entry
 
     def cached_display(self, cid: int) -> int:
-        """The first display id the client cached for the creature that this build carries."""
-        found = self.facts.cached_creatures.get(cid)
-        for display in found.displays if found else ():
-            if display > 0 and display in self.era.display_ids:
-                return display
+        """The first display id the client cached for the creature that this build carries, then
+        the first the creature harvest states."""
+        for found in (self.facts.cached_creatures.get(cid), self.facts.harvest_creatures.get(cid)):
+            for display in found.displays if found else ():
+                if display > 0 and display in self.era.display_ids:
+                    return display
         return 0
 
-    def cached_named(self, name: str) -> cache_mod.CachedCreature | None:
+    def cached_named(
+        self, name: str, creatures: Mapping[int, cache_mod.CachedCreature] | None = None
+    ) -> cache_mod.CachedCreature | None:
         """The cached creature an encounter names: exactly, then case folded; the lowest entry
         id where several share the name. A creature the dump knows, or one already taken, is
-        never offered: the index already has it."""
+        never offered: the index already has it. `creatures` defaults to the creature cache; the
+        creature harvest is matched by the same rule."""
+        source = self.facts.cached_creatures if creatures is None else creatures
         offered = [
             c
-            for cid, c in sorted(self.facts.cached_creatures.items())
+            for cid, c in sorted(source.items())
             if cid not in self.era.creatures and cid not in self.cache_used
         ]
         for same in (lambda c: c.name == name, lambda c: c.name.casefold() == name.casefold()):
@@ -876,8 +885,8 @@ class _Stage:
     def name_new_boss(self, entry: _Entry) -> None:
         """c, cd and ct for an encounter new in Forever that nothing else named: the build's own
         encounter models first (cd, and c where the table gives a creature), then the client's
-        the build's achievement kill criteria, then the creature cache, then
-        curated/new_bosses.json. The entry stays new (g = 1)."""
+        the build's achievement kill criteria, then the creature cache, then the creature harvest,
+        then curated/new_bosses.json. The entry stays new (g = 1)."""
         display, creature = self.facts.client_models.get(entry.encounter, (0, 0))
         display = display if display in self.era.display_ids else 0
         if creature > 0 and creature not in self.era.creatures and creature not in self.cache_used:
@@ -949,6 +958,24 @@ class _Stage:
             entry.creature_type = cached.creature_type
             self.named["namedByCache"] += 1
             self._record(entry, PROVENANCE_CACHE)
+            return
+        harvested = self.cached_named(entry.name, self.facts.harvest_creatures)
+        if harvested is not None:
+            self.cache_used.add(harvested.id)
+            entry.creatures = (harvested.id,)
+            entry.display = self.cached_display(harvested.id)
+            seen = self.facts.cached_creatures.get(harvested.id)
+            entry.creature_type = seen.creature_type if seen else 0
+            row = self.facts.curated_bosses.get(entry.encounter)
+            if row is not None and row.creature != harvested.id:
+                self.naming_notes.append(
+                    f"new bosses: encounter {entry.encounter} ({entry.name}): the row names creature "
+                    f"{row.creature}, the creature harvest {harvested.id}; the row is refused"
+                )
+            elif row is not None and not entry.display and row.display in self.era.display_ids:
+                entry.display = row.display
+            self.named["namedByHarvest"] += 1
+            self._record(entry, PROVENANCE_HARVEST)
             return
         row = self.facts.curated_bosses.get(entry.encounter)
         if row is None or row.creature in self.era.creatures or row.creature in self.cache_used:
@@ -2015,6 +2042,7 @@ NEW_BOSSES_PROVENANCE = "community"
 PROVENANCE_CLIENT = "client tables"
 PROVENANCE_CRITERIA = "client criteria"
 PROVENANCE_CACHE = "creature cache"
+PROVENANCE_HARVEST = "creature harvest"
 PROVENANCE_CURATED = "curated"
 # Criteria.Type for "kill a creature", whose Asset is the creature id.
 CRITERIA_KILL_CREATURE = 0
@@ -2335,12 +2363,22 @@ def gather_input(
     mouths_path: Path | None = None,
     spots_path: Path | None = None,
     creature_ids: Collection[int] = (),
+    same_tables: Collection[str] = (),
+    banked_creatures: Mapping[int, cache_mod.CachedCreature] | None = None,
+    banked_files: int = 0,
+    harvest_creatures: Mapping[int, cache_mod.CachedCreature] | None = None,
 ) -> BossLootInput:
     """Read the client tables of both builds and the credits. Everything here is I/O.
     `creature_caches` are the creaturecache.wdb files to read (the client's own first), and
     `new_bosses_path` is curated/new_bosses.json, `mouths_path` curated/instance_mouths.json and
     `spots_path` curated/world_boss_spots.json, each where it is there; `creature_ids` are the
-    dump's creatures, which a spot's row must name."""
+    dump's creatures, which a spot's row must name.
+
+    `same_tables` are the builds whose tables are the same as `build`'s: a creature cache of one
+    of them is read (brief W21). `banked_creatures` are creatures a caller already read from
+    such caches and kept (the pipeline's cache bank), read first, with `banked_files` the files
+    behind them; a file in `creature_caches` replaces a banked record of the same creature.
+    `harvest_creatures` are the creatures a creature sweep named, consulted after the cache."""
     maps = {
         _int(row["ID"]): MapFacts(
             id=_int(row["ID"]),
@@ -2448,8 +2486,10 @@ def gather_input(
         if kill_criteria
         else "no achievement kill criteria on this build"
     )
-    merged = cache_mod.read_many(list(creature_caches), build=build)
+    merged = cache_mod.read_many(list(creature_caches), build=build, same_tables=same_tables)
     notes.extend(merged.notes)
+    cached = dict(banked_creatures or {})
+    cached.update(merged.creatures)
     curated: dict[int, NewBossRow] = {}
     if new_bosses_path is not None and new_bosses_path.is_file():
         curated, refused = validate_new_bosses(
@@ -2472,8 +2512,9 @@ def gather_input(
         client_models=client_models,
         client_source=client_source,
         kill_criteria=kill_criteria,
-        cached_creatures=merged.creatures,
-        cache_files=len(merged.files_read),
+        cached_creatures=cached,
+        cache_files=len(merged.files_read) + banked_files,
+        harvest_creatures=dict(harvest_creatures or {}),
         curated_bosses=curated,
         mouths=mouths,
         spots=spots,

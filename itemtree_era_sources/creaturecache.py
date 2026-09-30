@@ -39,6 +39,7 @@ change on a later build is an error, never a silent misread.
 from __future__ import annotations
 
 import struct
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -165,14 +166,15 @@ def parse_record(entry: int, body: bytes) -> CachedCreature:
     )
 
 
-def parse(data: bytes, *, build: int | None = None) -> CreatureCache:
-    """The whole file. `build`, where given, is the only build stamp accepted."""
+def parse(data: bytes, *, build: int | None = None, also: Collection[int] = ()) -> CreatureCache:
+    """The whole file. `build`, where given, is the build stamp accepted, with every stamp in
+    `also` (the builds whose tables are the same as `build`'s, brief W21)."""
     if len(data) < HEADER.size:
         raise CreatureCacheError("too short for a WDB header")
     magic, stamp, locale, _size, _version, _cache_version = HEADER.unpack_from(data, 0)
     if magic != MAGIC:
         raise CreatureCacheError(f"not a creature cache (magic {magic!r})")
-    if build is not None and stamp != build:
+    if build is not None and stamp != build and stamp not in also:
         raise CreatureCacheError(f"the cache is build {stamp}'s, not {build}'s")
     creatures: dict[int, CachedCreature] = {}
     offset = HEADER.size
@@ -188,8 +190,10 @@ def parse(data: bytes, *, build: int | None = None) -> CreatureCache:
     return CreatureCache(build=stamp, locale=locale[::-1].decode("ascii", "replace"), creatures=creatures)
 
 
-def read(path: Path, *, build: str | None = None) -> CreatureCache:
-    """Read the file. `build` is the compile's build id; a cache of any other build is refused."""
+def read(path: Path, *, build: str | None = None, same_tables: Collection[str] = ()) -> CreatureCache:
+    """Read the file. `build` is the compile's build id. A cache of any other build is refused,
+    unless that build is one of `same_tables`: the builds whose manifests record the same sha256
+    for every table as `build`'s (manifest.same_tables_builds, brief W21)."""
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -197,7 +201,15 @@ def read(path: Path, *, build: str | None = None) -> CreatureCache:
     number = build_number(build) if build else None
     if build and number is None:
         raise CreatureCacheError(f"build {build} states no client build number to check the cache against")
-    return parse(data, build=number)
+    also = {n for n in (build_number(other) for other in same_tables) if n is not None}
+    return parse(data, build=number, also=also)
+
+
+def same_tables_note(path: Path, cache: CreatureCache, build: str) -> str | None:
+    """The note for a cache read under the same tables rule, or None for the build's own."""
+    if cache.build == build_number(build):
+        return None
+    return f"{path.name} read: the cache is build {cache.build}'s, whose tables match {build}'s"
 
 
 # The drop folder under the data root's cache/ for the files testers send (gitignored, as the
@@ -221,18 +233,22 @@ def drop_files(cache_dir: Path) -> list[Path]:
     return sorted(path for path in folder.rglob("*.wdb") if path.is_file()) if folder.is_dir() else []
 
 
-def read_many(paths: list[Path], *, build: str) -> MergedCache:
-    """Read and merge `paths` in order. A file that cannot be read, is another build's or does
-    not fit the layout is left out with a note naming it. A creature two files name keeps the
-    first file's record; where the later one states other display ids, that is noted."""
+def read_many(paths: list[Path], *, build: str, same_tables: Collection[str] = ()) -> MergedCache:
+    """Read and merge `paths` in order. A file that cannot be read, is the cache of a build whose
+    tables differ or does not fit the layout is left out with a note naming it; one of a build in
+    `same_tables` is read with a note saying so. A creature two files name keeps the first file's
+    record; where the later one states other display ids, that is noted."""
     merged = MergedCache(creatures={}, files_read=[], notes=[])
     first_file: dict[int, Path] = {}
     for path in paths:
         try:
-            cache = read(path, build=build)
+            cache = read(path, build=build, same_tables=same_tables)
         except CreatureCacheError as exc:
             merged.notes.append(f"{path.name} left out: {exc}")
             continue
+        note = same_tables_note(path, cache, build)
+        if note:
+            merged.notes.append(note)
         merged.files_read.append(path)
         for entry, creature in cache.creatures.items():
             kept = merged.creatures.get(entry)
