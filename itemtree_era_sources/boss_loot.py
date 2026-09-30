@@ -2363,6 +2363,24 @@ def apply_spots(era_table: era_mod.EraSources, era_input: era_mod.EraInput, fact
     return sum(len(records) for records in added.values())
 
 
+def forever_instance_areas(table: BossLoot) -> list[int]:
+    """Brief Z4: the area `a` of every place in the index that is new in Forever (`g`), in id
+    order. A place with no `a` (a world boss, or an instance this build states no area for) gives
+    none. Read from the derived places, so the set is whatever this build lists, never a list."""
+    return sorted({place["a"] for place in table.places if place.get("g") and place.get("a")})
+
+
+def apply_instance_zones(
+    era_table: era_mod.EraSources, era_input: era_mod.EraInput, table: BossLoot
+) -> list[int]:
+    """Brief Z4 (2026-10-01): name each instance new in Forever in EraSources' `z`, so the addon can
+    open its map button's zone page and find it in search. The join is one way: the Boss loot
+    index is derived first (it reads the EraSources table), then this hands its new places' areas
+    to era_sources.add_zones with THIS build's own AreaTable names, and only then is EraSources
+    written. An area `z` already names is left alone. Returns the areas added."""
+    return era_mod.add_zones(era_table, forever_instance_areas(table), era_input.areas)
+
+
 def gather_input(
     conn: sqlite3.Connection,
     build: str,

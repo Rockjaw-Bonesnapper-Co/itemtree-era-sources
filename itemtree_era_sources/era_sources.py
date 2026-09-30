@@ -121,7 +121,7 @@ import re
 import shutil
 import sqlite3
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1099,6 +1099,39 @@ class EraSources:
 
 
 # ----- fetching and verifying the pinned files -----------------------------------------------
+
+
+def add_zones(table: EraSources, areas: Iterable[int], names: Mapping[int, str]) -> list[int]:
+    """Brief Z4 (2026-10-01): give `z` an entry for each of `areas` it does not already name, the
+    name read from `names` (THIS build's own AreaTable), and return the areas added in id order.
+
+    What calls it is boss_loot.apply_instance_zones, with the Boss loot places new in Forever: an
+    instance the Classic Era databases never knew holds no row and no pin, so nothing else in the
+    table names its area, and the addon could neither open nor find it as a zone. Nothing else
+    moves: a name `s` already holds is reused, and a new one is APPENDED after every other string,
+    so no index already handed out changes (`r`, `mp`, `op` and every other table keyed by a
+    string index are byte for byte what they were). No `zm` entry: an instance has no map. An area
+    `names` does not name, or names with an empty string, is skipped."""
+    held = {value: index for index, value in enumerate(table.strings, start=1)}
+    added: list[int] = []
+    for area in sorted(set(areas)):
+        name = names.get(area, "")
+        if area in table.areas or not name:
+            continue
+        index = held.get(name)
+        if index is None:
+            table.strings.append(name)
+            index = len(table.strings)
+            held[name] = index
+        table.areas[area] = index
+        added.append(area)
+    if added:
+        table.areas = dict(sorted(table.areas.items()))
+        table.counts["areas"] = len(table.areas)
+        table.counts["strings"] = len(table.strings)
+        table.counts["areasWithNoMap"] = len(table.areas) - len(table.area_maps)
+    table.counts["foreverInstanceAreas"] = table.counts.get("foreverInstanceAreas", 0) + len(added)
+    return added
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -4520,7 +4553,8 @@ def header_lines(table: EraSources) -> list[str]:
         "s: every string once, sorted; once it holds more than 8,280 strings (it does since "
         "2026-09-29) in two sorted runs: first the names an xl list record carries, whose field is "
         "two base 91 digits and stops at 8,280, then every other string. The order means nothing "
-        "else; look a string up by its index.",
+        "else; look a string up by its index. The names of the instances new in Forever that z "
+        "names (and no other string held) come last, after both runs.",
         "c: 1 boss drop, 2 zone drop (reserved, never emitted), 3 quest, 4 vendor, 5 world "
         "drop, 6 creature drop, 7 skinned from, 8 herb node, 9 mining vein, 10 fished, "
         "11 world object or chest, 12 pickpocketed, 13 found inside a container item.",
@@ -4691,7 +4725,13 @@ def header_lines(table: EraSources) -> list[str]:
         "for).",
         f"{counts.get('rowsInsideInstance', 0)} rows and "
         f"{counts.get('listEntriesInsideInstance', 0)} list entries carry one of the "
-        f"{counts.get('instanceAreas', 0)} instance areas, which are places with no map.",
+        f"{counts.get('instanceAreas', 0)} instance areas, which are places with no map."
+        + (
+            f" z also names {counts['foreverInstanceAreas']} instances new in Forever (the Boss loot "
+            "places), which carry no row and no pin."
+            if counts.get("foreverInstanceAreas")
+            else ""
+        ),
     ]
 
 
