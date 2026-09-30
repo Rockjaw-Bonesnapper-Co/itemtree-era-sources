@@ -526,6 +526,24 @@ UI_MAP_TYPE_ZONE = 3
 UI_MAP_TYPE_ORPHAN = 6
 PIN_MAP_TYPES = frozenset({UI_MAP_TYPE_ZONE, UI_MAP_TYPE_ORPHAN})
 
+# ----- the paths (brief W18) ----------------------------------------------------------------
+#
+# A creature that walks does not stand at its spawn point: Azuregos patrols a stretch of Azshara
+# and Lord Kazzak paces the Tainted Scar. CMaNGOS states the walk as waypoints, per spawn in
+# `creature_movement` (by guid) or per creature in `creature_movement_template` (by entry and
+# path id), and a spawn walks one only when its `MovementType` is 2. The reader keeps every path
+# in the dump; what ships (`pt`) is the paths of the creatures whose rank is in PATH_RANKS, the
+# CMaNGOS boss rank, because a path is only worth its bytes on a boss's map. A path is placed
+# on the zone map of its spawn's own pin area, every point by the same map_position the pins
+# use, rounded to a tenth of a percent, a point off that map dropped, a point equal to the one
+# before it dropped, and then thinned to PATH_CAP points: evenly spaced by index, the first and
+# the last always kept. A path of fewer than PATH_MIN_POINTS points after that is not shipped.
+PATH_RANKS = frozenset({3})
+PATH_CAP = 32
+PATH_MIN_POINTS = 2
+# creature.MovementType 2: the spawn walks its waypoints.
+MOVEMENT_WAYPOINT = 2
+
 # ----- the instance areas -------------------------------------------------------------------
 #
 # A creature that lives inside an instance had no place at all until 2026-09-21. pfQuest states
@@ -585,6 +603,46 @@ def pack_pin(area: int, x: float, y: float) -> str:
         + pack_int(int(round(x * PIN_TENTHS)), PIN_COORD_DIGITS)
         + pack_int(int(round(y * PIN_TENTHS)), PIN_COORD_DIGITS)
     )
+
+
+def pack_path(area: int, points: Sequence[tuple[float, float]]) -> str:
+    """One path (brief W18): the area id once, then each point's x and y in tenths of a percent,
+    in walking order. The same digits and widths as a pin, with the area said once."""
+    out = [pack_int(area, PIN_AREA_DIGITS)]
+    for x, y in points:
+        out.append(pack_int(int(round(x * PIN_TENTHS)), PIN_COORD_DIGITS))
+        out.append(pack_int(int(round(y * PIN_TENTHS)), PIN_COORD_DIGITS))
+    return "".join(out)
+
+
+def unpack_int(text: str) -> int:
+    """The inverse of pack_int, for readers inside the pipeline (boss_loot reads `pt` and `mp`)."""
+    value = 0
+    for ch in text:
+        code = ord(ch)
+        value = value * PACK_BASE + (code - 1 if code > PACK_SKIPPED else code) - PACK_FIRST
+    return value
+
+
+def pin_areas(packed: str) -> list[int]:
+    """The area of every record of one packed `mp` or `op` string, in record order."""
+    width = PIN_AREA_DIGITS + 2 * PIN_COORD_DIGITS
+    return [unpack_int(packed[at : at + PIN_AREA_DIGITS]) for at in range(0, len(packed), width)]
+
+
+def path_area(packed: str) -> int:
+    """The area one packed `pt` path is drawn on."""
+    return unpack_int(packed[:PIN_AREA_DIGITS])
+
+
+def thin_path(points: Sequence[tuple[float, float]], cap: int = PATH_CAP) -> list[tuple[float, float]]:
+    """At most `cap` points, evenly spaced by index, the first and the last always kept."""
+    if len(points) <= cap:
+        return list(points)
+    if cap < 2:
+        raise EraSourcesError(f"a path cap of {cap} cannot keep both ends")
+    step = (len(points) - 1) / (cap - 1)
+    return [points[int(round(number * step))] for number in range(cap)]
 
 
 def pack_kind(creature_type: int, family: int, min_level: int, max_level: int) -> int:
@@ -846,6 +904,12 @@ class EraInput:
     # the area id and for the cross check. `area_maps` and `map_bounds` are THIS build's own.
     spawns: tuple[Spawn, ...] = ()
     spawn_entries: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    # Brief W18, the paths' three inputs: the guids whose `creature.MovementType` is a waypoint
+    # walk; `creature_movement`, guid -> its waypoints in walking order as world (x, y); and
+    # `creature_movement_template`, creature id -> path id -> the same. CMaNGOS positions only.
+    waypoint_guids: set[int] = field(default_factory=set)
+    paths: dict[int, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+    template_paths: dict[int, dict[int, tuple[tuple[float, float], ...]]] = field(default_factory=dict)
     unit_points: dict[int, tuple[SpawnPoint, ...]] = field(default_factory=dict)
     # areaId -> the zone level UiMap id this build gives it, for every area it can resolve.
     area_maps: dict[int, int] = field(default_factory=dict)
@@ -918,6 +982,9 @@ class EraSources:
     # An OBJECT name's index into `s` -> its map pins, packed by pack_pin (brief D7). Its own
     # table rather than `mp`, because one string can name a creature and an object both.
     object_pins: dict[int, str] = field(default_factory=dict)
+    # Brief W18: a creature name's index into `s` -> the paths it walks, each a string packed by
+    # pack_path, for a boss (PATH_RANKS) only. See docs/era-sources.md, "Paths".
+    paths: dict[int, list[str]] = field(default_factory=dict)
     # An object name's index into `s` -> the category its rows are filed under (8 herb, 9 vein,
     # 10 fishing pool, 11 chest), for every name `op` carries.
     object_kinds: dict[int, int] = field(default_factory=dict)
@@ -955,6 +1022,7 @@ class EraSources:
             "cd": dict(self.displays),
             "mp": dict(self.pins),
             "op": dict(self.object_pins),
+            "pt": {index: list(walks) for index, walks in self.paths.items()},
             "ok": dict(self.object_kinds),
             "qg": {index: list(pair) for index, pair in self.quest_givers.items()},
             "zm": dict(self.area_maps),
@@ -1067,6 +1135,12 @@ WANTED_TABLES = (
     "creature",
     "creature_spawn_entry",
     "pool_creature",
+    # Brief W18: a pool that names a creature ENTRY rather than a spawn, so every spawn of that
+    # creature is one member of the pool; and the waypoints a spawn or a creature walks. Of the
+    # waypoint tables only the ids, the point number and the two world coordinates are read.
+    "pool_creature_template",
+    "creature_movement",
+    "creature_movement_template",
     "game_event_creature",
     "creature_template",
     "gameobject_template",
@@ -1186,6 +1260,15 @@ class _Reading:
     spawn_entries: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
     events: dict[int, int] = field(default_factory=dict)
     pools: set[int] = field(default_factory=set)
+    # Brief W18: the creature ids `pool_creature_template` pools, the guids whose MovementType is
+    # a waypoint walk, and the waypoints themselves as (point number, x, y), per guid and per
+    # (creature id, path id).
+    pool_entries: set[int] = field(default_factory=set)
+    waypoint_guids: set[int] = field(default_factory=set)
+    paths: dict[int, list[tuple[int, float, float]]] = field(default_factory=lambda: defaultdict(list))
+    template_paths: dict[tuple[int, int], list[tuple[int, float, float]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
     # guid -> (object id, map, x, y), the `gameobject` table with everything else dropped, and
     # the entries `gameobject_spawn_entry` names for a guid that leaves its id at 0.
     object_rows: list[tuple[int, int, int, float, float]] = field(default_factory=list)
@@ -1251,10 +1334,16 @@ def read_cmangos(path: Path) -> EraInput:
             x=x,
             y=y,
             event=reading.events.get(guid, 0),
-            pooled=guid in reading.pools,
+            pooled=guid in reading.pools or (creature != 0 and creature in reading.pool_entries),
         )
         for guid, creature, map_id, x, y in sorted(reading.spawn_rows)
     )
+    era.waypoint_guids = set(reading.waypoint_guids)
+    era.paths = {guid: _walk(points) for guid, points in sorted(reading.paths.items())}
+    template_paths: dict[int, dict[int, tuple[tuple[float, float], ...]]] = defaultdict(dict)
+    for (entry, path_id), points in sorted(reading.template_paths.items()):
+        template_paths[entry][path_id] = _walk(points)
+    era.template_paths = dict(template_paths)
     era.spawn_entries = {
         guid: tuple(sorted(set(entries))) for guid, entries in sorted(reading.spawn_entries.items())
     }
@@ -1263,6 +1352,11 @@ def read_cmangos(path: Path) -> EraInput:
         reading.object_rows, reading.object_entries, era.objects
     )
     return era
+
+
+def _walk(points: Sequence[tuple[int, float, float]]) -> tuple[tuple[float, float], ...]:
+    """One path's waypoints in walking order (by point number), as world (x, y)."""
+    return tuple((x, y) for _point, x, y in sorted(points))
 
 
 def object_maps(rows: Sequence[tuple], entries: Mapping[int, Sequence[int]]) -> dict[int, tuple[int, ...]]:
@@ -1400,7 +1494,11 @@ def _absorb(
         return
     if table == "creature":
         # The position and the map, and nothing else: not the z, not the orientation, not the
-        # respawn times, not the spawn distance and not the movement type.
+        # respawn times and not the spawn distance. Since brief W18 the movement type is read for
+        # one bit, whether the spawn walks its waypoints (MOVEMENT_WAYPOINT), kept apart from
+        # Spawn in EraInput.waypoint_guids.
+        if _int(col("MovementType")) == MOVEMENT_WAYPOINT:
+            reading.waypoint_guids.add(_int(col("guid")))
         reading.spawn_rows.append(
             (
                 _int(col("guid")),
@@ -1438,6 +1536,20 @@ def _absorb(
         # The pool's own chance and description are read for nothing: what matters is that the
         # row is one member of a pool, so the point is a place the creature is found.
         reading.pools.add(_int(col("guid")))
+        return
+    if table == "pool_creature_template":
+        # Brief W18: the same, for a pool that names the creature rather than one spawn of it.
+        reading.pool_entries.add(_int(col("id")))
+        return
+    if table == "creature_movement":
+        # Brief W18: the point number and the two world coordinates. Not the z, the orientation,
+        # the wait time, the script or the comment.
+        point = (_int(col("Point")), _num(col("PositionX")), _num(col("PositionY")))
+        reading.paths[_int(col("Id"))].append(point)
+        return
+    if table == "creature_movement_template":
+        point = (_int(col("Point")), _num(col("PositionX")), _num(col("PositionY")))
+        reading.template_paths[(_int(col("Entry")), _int(col("PathId")))].append(point)
         return
     if table in ("creature_questrelation", "creature_involvedrelation"):
         pair = (_int(col("id")), _int(col("quest")))
@@ -3059,6 +3171,197 @@ def _creature_pins(
     return pins
 
 
+def template_walk(era_input: EraInput, creature: int) -> tuple[tuple[float, float], ...] | None:
+    """The creature's own `creature_movement_template` path, the lowest path id where it states
+    several (a script picks between them; path 0 is the one a spawn walks by default)."""
+    by_path = era_input.template_paths.get(creature)
+    if not by_path:
+        return None
+    return by_path[min(by_path)] or None
+
+
+def spawn_walk(era_input: EraInput, spawn: Spawn, creature: int) -> tuple[tuple[float, float], ...] | None:
+    """The path one spawn walks: none unless its MovementType is a waypoint walk, then its own
+    `creature_movement` rows, else its creature's template path."""
+    if spawn.guid not in era_input.waypoint_guids:
+        return None
+    return era_input.paths.get(spawn.guid) or template_walk(era_input, creature)
+
+
+def place_path(box: MapBounds, walk: Sequence[tuple[float, float]]) -> tuple[list[tuple[float, float]], int]:
+    """A path on one zone map: (its points as map percentages rounded to a tenth, in walking
+    order, a point off the map or equal to the one before it dropped; how many were off the map)."""
+    out: list[tuple[float, float]] = []
+    off = 0
+    for world_x, world_y in walk:
+        x, y = map_position(box, world_x, world_y)
+        if not (0.0 <= x <= 100.0 and 0.0 <= y <= 100.0):
+            off += 1
+            continue
+        point = (round(x, PIN_PLACES), round(y, PIN_PLACES))
+        if out and out[-1] == point:
+            continue
+        out.append(point)
+    return out, off
+
+
+def _zone_candidates(era_input: EraInput, creature: int) -> list[int]:
+    """The creature's pfQuest areas this build names and draws, commonest first (the pin rule)."""
+    return [
+        area
+        for area in era_input.unit_zones.get(creature, ())
+        if area in era_input.areas and area in era_input.area_maps
+    ]
+
+
+def listed_creatures(era_input: EraInput) -> set[int]:
+    """Every creature id any `creature` row names, an event only row included."""
+    out: set[int] = set()
+    for spawn in era_input.spawns:
+        out.update((spawn.creature,) if spawn.creature else era_input.spawn_entries.get(spawn.guid, ()))
+    out.discard(0)
+    return out
+
+
+def _unspawned_walkers(
+    era_input: EraInput, listed: Collection[int]
+) -> dict[tuple[tuple[float, float], ...], list[int]]:
+    """A template path -> the creatures with no `creature` row at all (script spawns) that walk
+    exactly it. The four dragons of the Emerald Dream share one, which is how the dump says any of
+    them walks it. A creature whose only rows are event only is not one: it is not found at all."""
+    walkers: dict[tuple[tuple[float, float], ...], list[int]] = defaultdict(list)
+    for creature in sorted(era_input.template_paths):
+        if creature in listed:
+            continue
+        walk = template_walk(era_input, creature)
+        if walk:
+            walkers[walk].append(creature)
+    return walkers
+
+
+def shared_places(era_input: EraInput) -> set[int]:
+    """Brief W18: the creature ids whose places are shared, so at a time the creature stands at
+    one of them, or another creature does: a pooled spawn (`pool_creature`, or a creature
+    `pool_creature_template` pools), a spawn `creature_spawn_entry` gives several creatures, or,
+    for a creature with no `creature` row at all, a template path another such creature walks too."""
+    out: set[int] = set()
+    for spawn in era_input.spawns:
+        if spawn.event > 0:
+            continue
+        ids = (spawn.creature,) if spawn.creature else tuple(era_input.spawn_entries.get(spawn.guid, ()))
+        if spawn.pooled or len(ids) > 1:
+            out.update(creature for creature in ids if creature)
+    for creatures in _unspawned_walkers(era_input, listed_creatures(era_input)).values():
+        if len(creatures) > 1:
+            out.update(creatures)
+    return out
+
+
+def _creature_paths(
+    era_input: EraInput,
+    names: set[str],
+    strings: _Strings,
+    used_areas: dict[int, int],
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> dict[int, list[str]]:
+    """Brief W18: a boss name's index into `s` -> the paths it walks, packed by pack_path.
+
+    Only a creature whose rank is in PATH_RANKS and whose name the table ships. A spawn that
+    walks (spawn_walk) has its path drawn on the zone map of the spawn's own pin area, found by
+    the very rule the pins use (_pin_area), so the path and the pin are on one map. A creature
+    with no `creature` row at all (a script spawn: Maws, the four dragons) walks its template
+    path; the dump states no map for one, so it is drawn on the first of the creature's own
+    pfQuest areas whose zone map holds every point of it, then the first of the areas of every
+    other spawnless creature that walks exactly the same path (the dragons share one). A path
+    none of those holds, or with fewer than PATH_MIN_POINTS points on its map, is not shipped.
+    """
+    by_creature, _event_only, _nameless = _spawns_by_creature(era_input.spawns, era_input.spawn_entries)
+    listed = listed_creatures(era_input)
+    walkers = _unspawned_walkers(era_input, listed)
+    boxes: dict[int, list[MapBounds]] = defaultdict(list)
+    for (ui_map, _map_id), box in sorted(era_input.map_bounds.items()):
+        boxes[ui_map].append(box)
+
+    def holds(box: MapBounds, walk: Sequence[tuple[float, float]]) -> bool:
+        for world_x, world_y in walk:
+            x, y = map_position(box, world_x, world_y)
+            if not (0.0 <= x <= 100.0 and 0.0 <= y <= 100.0):
+                return False
+        return True
+
+    out: dict[int, set[str]] = defaultdict(set)
+    points_shipped = thinned = off_map = not_placed = 0
+    for creature in sorted(era_input.creatures):
+        facts = era_input.creatures[creature]
+        if facts.rank not in PATH_RANKS or facts.name not in names:
+            continue
+        candidates = _zone_candidates(era_input, creature)
+        found: list[tuple[int, MapBounds, tuple[tuple[float, float], ...]]] = []
+        spawns = by_creature.get(creature, ())
+        if spawns:
+            stated: dict[int, list[SpawnPoint]] = defaultdict(list)
+            for point in era_input.unit_points.get(creature, ()):
+                stated[point.area].append(point)
+            maps = {area: era_input.area_maps[area] for area in candidates}
+            for spawn in spawns:
+                walk = spawn_walk(era_input, spawn, creature)
+                if not walk:
+                    continue
+                where = None
+                if candidates:
+                    where = _pin_area(spawn, candidates, maps, era_input.map_bounds, stated)
+                if where is None:
+                    not_placed += 1
+                    continue
+                found.append((where[0], era_input.map_bounds[(maps[where[0]], spawn.map)], walk))
+        elif creature in listed:
+            # Every row it has is event only, so it is not found at all, as its pins say.
+            continue
+        else:
+            walk = template_walk(era_input, creature)
+            if not walk:
+                continue
+            shared = list(candidates)
+            for other in walkers.get(walk, ()):
+                if other != creature:
+                    shared.extend(area for area in _zone_candidates(era_input, other) if area not in shared)
+            chosen = next(
+                (
+                    (area, box)
+                    for area in shared
+                    for box in boxes.get(era_input.area_maps[area], ())
+                    if holds(box, walk)
+                ),
+                None,
+            )
+            if chosen is None:
+                not_placed += 1
+                continue
+            found.append((chosen[0], chosen[1], walk))
+        for area, box, walk in found:
+            on_map, missed = place_path(box, walk)
+            off_map += missed
+            if len(on_map) < PATH_MIN_POINTS:
+                not_placed += 1
+                continue
+            kept = thin_path(on_map)
+            thinned += len(on_map) - len(kept)
+            packed = pack_path(area, kept)
+            index = strings.add(facts.name)
+            if packed not in out[index]:
+                out[index].add(packed)
+                points_shipped += len(kept)
+            used_areas[area] = strings.add(era_input.areas[area])
+    counts["pathNames"] = len(out)
+    counts["paths"] = sum(len(walks) for walks in out.values())
+    counts["pathPoints"] = points_shipped
+    counts["pathPointsThinned"] = thinned
+    counts["pathPointsOffMap"] = off_map
+    dropped["pathNotPlaced"] = not_placed
+    return {index: sorted(walks) for index, walks in sorted(out.items())}
+
+
 # The categories whose `n` is an OBJECT, which are the ones an object pin is made for, and the
 # word each is counted under.
 OBJECT_CATEGORIES = {CAT_HERB: "Herb", CAT_VEIN: "Vein", CAT_FISHED: "Pool", CAT_OBJECT: "Chest"}
@@ -3456,6 +3759,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         "pinInsideInstance": 0,
         "pinOutsideMap": 0,
         "pinNoAreaKnown": 0,
+        "pathNotPlaced": 0,
         "objectPinInsideInstance": 0,
         "objectPinOutsideMap": 0,
         "objectPinNoAreaKnown": 0,
@@ -3580,6 +3884,8 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
     # The pins go last, because a pin's own area is an area the player can now read and so has to
     # reach `z` and `s` before the string table is sorted.
     pins = _creature_pins(era_input, npc_names, strings, used_areas, counts, dropped)
+    # Brief W18: a boss's paths, after the pins for the same reason: a path's area reaches `z`.
+    paths = _creature_paths(era_input, npc_names, strings, used_areas, counts, dropped)
     counts["vendorNames"] = len(vendor_names)
     counts["vendorNamesSharedWithCreature"] = len(vendor_names & creature_names)
     counts["vendorKinds"] = sum(1 for packed in kinds.values() if packed < 0)
@@ -3669,6 +3975,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         remap[index]: "".join(pack_pin(pin.area, pin.x, pin.y) for pin in made)
         for index, made in pins.items()
     }
+    paths_out = {remap[index]: walks for index, walks in paths.items()}
     object_pins_out = {
         remap[index]: "".join(pack_pin(pin.area, pin.x, pin.y) for pin in made)
         for index, made in object_pins.items()
@@ -3746,6 +4053,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         kinds=dict(sorted(kinds.items())),
         displays=dict(sorted(displays.items())),
         pins=dict(sorted(pins_out.items())),
+        paths=dict(sorted(paths_out.items())),
         object_pins=dict(sorted(object_pins_out.items())),
         object_kinds=dict(sorted(object_kinds_out.items())),
         area_maps=area_maps_out,
@@ -3780,6 +4088,7 @@ def header_lines(table: EraSources) -> list[str]:
         "qt = { [questId] = string index or title }, ck = { [string index] = packed creature kind }, "
         "cd = { [string index] = creature display id }, "
         "mp = { [string index] = packed map pins }, op = { [string index] = packed map pins }, "
+        "pt = { [string index] = { packed path, ... } }, "
         "ok = { [string index] = object category }, qg = { [string index] = { starts, ends } }, "
         "zm = { [areaId] = uiMapId }, st = { [string index] = string index }, "
         "cf = { [string index] = side }, tr = { [string index] = packed spell ids }, "
@@ -3862,7 +4171,14 @@ def header_lines(table: EraSources) -> list[str]:
         "chest), as map pins in exactly mp's packing and by exactly mp's rule, over the cmangos "
         "gameobject spawns of every chest or fishing hole of that name with loot, each spawn's "
         "area taken from pfQuest's objects file. Its own table and not mp, because s is one "
-        "string table and one name can be a creature's and an object's both.",
+        "string table and one name can be a creature's and an object's both. "
+        "pt: the paths a boss NAME walks (cmangos creature rank 3 only), keyed the way ck is: a "
+        "list of packed strings, one per path, each the areaId once "
+        f"({PIN_AREA_DIGITS} digits) then every point's x and y in TENTHS of a percent of that "
+        f"area's zone map ({PIN_COORD_DIGITS} digits each), in walking order, from the cmangos "
+        "creature_movement and creature_movement_template waypoints, drawn on the zone map of "
+        f"the spawn's own pin area. At most {PATH_CAP} points, thinned evenly with the first and "
+        "the last kept. A name with no entry walks no known path.",
         "ok: the category an op name's rows are filed under (8 herb, 9 vein, 10 fishing pool, "
         "11 chest; the lower where a name is filed under two), for every name op carries and "
         "no other, so the addon can say what a node is and whether it has a map without "

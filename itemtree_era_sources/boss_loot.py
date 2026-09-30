@@ -722,6 +722,11 @@ class _Stage:
         self.object_loot = era_mod.expand_loot(era_input.object_loot, era_input.reference_loot, self.dropped)
         self.world = world_drop_items(era_input, self.creature_loot)
         self.maps = spawn_maps(era_input)
+        # Brief W18: the EraSources table this index is compiled beside, for a world boss's pins
+        # and paths, and the creatures whose places are shared (a pool, a shared spawn point, a
+        # shared path), for `po`.
+        self.era_table = era_table
+        self.shared = era_mod.shared_places(era_input)
         # The name a creature page opens by, where EraSources carries a kind for it.
         self.era_names: dict[str, int] = {}
         if era_table is not None:
@@ -1147,6 +1152,15 @@ class _Stage:
             return frozenset()
         return frozenset(self.facts.areas[area].continent for area in zones)
 
+    def era_positions(self, entry: _Entry) -> tuple[list[int], list[int]]:
+        """Brief W18: (the area of every EraSources pin, the area of every EraSources path) the
+        boss's name ships, in the table's own order. Empty without a table or a creature page."""
+        if self.era_table is None or not entry.era_name:
+            return [], []
+        pins = era_mod.pin_areas(self.era_table.pins.get(entry.era_name, ""))
+        paths = [era_mod.path_area(walk) for walk in self.era_table.paths.get(entry.era_name, ())]
+        return pins, paths
+
     def world_bosses(self) -> list[tuple[_Entry, list[int]]]:
         """Rank 3 creatures that stand only on the two continents and drop something rare."""
         by_name: dict[str, list[int]] = defaultdict(list)
@@ -1510,6 +1524,12 @@ def derive(
     raw: list[tuple[dict, list[_Entry], dict]] = []
     for entry, zones in stage.world_bosses():
         lv = _clamp(entry.lo)
+        # Brief W18: every zone the boss's shipped pins and paths are on joins its pfQuest zones,
+        # after them, so the zone strip offers every zone the boss can be found in.
+        pin_areas, path_areas = stage.era_positions(entry)
+        for area in (*pin_areas, *path_areas):
+            if area in era_input.areas and area not in zones:
+                zones.append(area)
         place = {
             "name": entry.name,
             "k": KIND_WORLD_BOSS,
@@ -1517,6 +1537,9 @@ def derive(
             "lo": lv,
             "hi": _clamp(entry.hi),
             "zones": zones,
+            "po": 1 if any(cid in stage.shared for cid in entry.creatures) else None,
+            "pins": len(pin_areas),
+            "paths": len(path_areas),
         }
         # A world boss's zones already say where it is: ez stays absent, ec is the continent
         # they share, from this build's AreaTable (source c).
@@ -1631,6 +1654,7 @@ def derive(
             "my": mouth.y if mouth else None,
             "sz": place.get("sz"),
             "g": place.get("g"),
+            "po": place.get("po"),
             "b": numbers,
         }
         places.append({key: value for key, value in out.items() if value is not None})
@@ -1651,6 +1675,11 @@ def derive(
                 "whereFrom": where.source,
                 "entrance": (pin.ui_map, pin.x, pin.y) if pin else None,
                 "mouth": (mouth.ui_map, mouth.x, mouth.y, mouth.verified) if mouth else None,
+                # Brief W18, world bosses only: how many pins and paths EraSources ships for the
+                # boss, and whether its places are shared.
+                "pins": place.get("pins", 0),
+                "paths": place.get("paths", 0),
+                "shared": bool(place.get("po")),
             }
         )
     bosses = [{key: value for key, value in boss.items() if value is not None} for boss in bosses]
@@ -1679,6 +1708,11 @@ def derive(
         "withEntrance": sum(1 for p in places if "eu" in p),
         "withMouth": sum(1 for p in places if "mu" in p),
         "withMouthUnverified": sum(1 for n in notes if n["mouth"] and not n["mouth"][3]),
+        "worldBossesShared": sum(1 for p in places if p.get("po")),
+        "worldBossesWithPath": sum(1 for n in notes if n["kind"] == KIND_WORLD_BOSS and n["paths"]),
+        "worldBossesWithNoPosition": sum(
+            1 for n in notes if n["kind"] == KIND_WORLD_BOSS and not n["pins"] and not n["paths"]
+        ),
         "cacheFiles": facts.cache_files,
         **stage.named,
     }
@@ -1738,7 +1772,9 @@ def header_lines(table: BossLoot) -> list[str]:
         "b = {bosses, rares and chests} }. v is the contract version; refuse any other.",
         "p = { n name (index into s), k kind (1 dungeon, 2 raid, 3 world boss), lv the level the "
         f"band is read from (1 to {MAX_PLAYER_LEVEL}), lo/hi the level range, m Map id, a the area "
-        "id EraSources uses, an the AreaTable name where it differs from n, z (k=3) the zones, "
+        "id EraSources uses, an the AreaTable name where it differs from n, z (k=3) the zones "
+        "(pfQuest's, then those of its EraSources pins and paths), po (k=3) 1 = its places are "
+        "shared, it stands at one of them at a time, "
         "ez the entrance zone's name (absent for k=3), ec the continent's name, "
         "eu/ex/ey the entrance pin (the zone UiMapID, and x from the left and y from the top in "
         f"tenths of a percent, 0 to {ENTRANCE_SCALE}; all three or none; the instance portal), "
@@ -1795,6 +1831,7 @@ def location_lines(table: BossLoot) -> list[str]:
             + (", new" if note["new"] else "")
             + (" (entrance {1} {2} on UiMap {0})".format(*note["entrance"]) if note.get("entrance") else "")
             + (_mouth_words(note["mouth"]) if note.get("mouth") else "")
+            + (_position_words(note) if note["kind"] == KIND_WORLD_BOSS else "")
         )
         if note["kind"] != KIND_WORLD_BOSS and not note["new"] and not (note["zone"] and note["continent"]):
             unresolved.append(note["name"])
@@ -1803,7 +1840,21 @@ def location_lines(table: BossLoot) -> list[str]:
     lines.append(f"Era instances not fully placed: {', '.join(unresolved) if unresolved else 'none'}")
     pinless = [n["name"] for n in table.notes if n["kind"] != KIND_WORLD_BOSS and not n.get("entrance")]
     lines.append(f"places with no entrance pin: {', '.join(pinless) if pinless else 'none'}")
+    # Brief W18: a world boss CMaNGOS places nowhere (a script spawn with no waypoints either).
+    nowhere = [
+        n["name"]
+        for n in table.notes
+        if n["kind"] == KIND_WORLD_BOSS and not n.get("pins") and not n.get("paths")
+    ]
+    lines.append(f"world bosses with no position: {', '.join(nowhere) if nowhere else 'none'}")
     return lines
+
+
+def _position_words(note: dict) -> str:
+    """ " (pins 1, paths 1, shared)": what EraSources places a world boss by (brief W18)."""
+    return f" (pins {note.get('pins', 0)}, paths {note.get('paths', 0)}" + (
+        ", shared)" if note.get("shared") else ")"
+    )
 
 
 # ----- reading the client tables and the credits ------------------------------------------------
