@@ -128,14 +128,22 @@ from pathlib import Path
 import httpx
 
 from .build_facts import BuildFacts
-from .paths import pipeline_version
 
 # ----- the pinned inputs ------------------------------------------------------------------
 
 CACHE_SUBDIR = "era"
-USER_AGENT = (
-    f"ItemTree-Data/{pipeline_version()} (+https://github.com/Rockjaw-Bonesnapper-Co/itemtree-era-sources)"
+# Every fetch sends these generic browser headers and nothing else: no tool name, version,
+# repository url, owner or contact detail, and no Referer (owner rule, 2026-09-30). They match the
+# pipeline's shared header set; the constants live here so this file stands alone.
+GENERIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36"
 )
+REQUEST_HEADERS = {
+    "User-Agent": GENERIC_USER_AGENT,
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 CMANGOS_COMMIT = "22b51464f1625f6ef6275771de1f5466c6f5d19e"
 PFQUEST_COMMIT = "104f35678ca39ab1fb78b655f815cc7016f5e0c8"
@@ -1095,7 +1103,7 @@ def fetch_pin(
     with httpx.Client(
         timeout=timeout,
         follow_redirects=True,
-        headers={"User-Agent": USER_AGENT},
+        headers=dict(REQUEST_HEADERS),
         transport=transport,
     ) as client:
         try:

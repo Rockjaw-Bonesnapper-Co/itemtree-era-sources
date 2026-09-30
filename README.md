@@ -28,7 +28,7 @@ its data:
 | `itemtree_era_sources/era_sources.py` | the compiler: fetches and verifies the pinned inputs, reads them, applies every rule, and builds the module's value and header |
 | `itemtree_era_sources/build_facts.py` | `BuildFacts`, the four facts about a client build the compiler needs |
 | `itemtree_era_sources/luaout.py` | the writer: serialises the module's value and header into the .lua bytes (`lua_value`, `lua_module`) |
-| `itemtree_era_sources/paths.py` | `pipeline_version`, which the compiler's user agent names (and the pipeline's path layout, unused here) |
+| `itemtree_era_sources/paths.py` | the pipeline's version and path layout, copied with the rest and unused here |
 | `NOTICE.md` | the upstream databases, their licences and commits |
 | `third_party/` | the upstream licence and copyright notices, verbatim |
 
