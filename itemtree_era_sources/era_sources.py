@@ -1036,6 +1036,10 @@ class EraSources:
     # boss_loot.apply_spots, from curated/world_boss_spots.json; empty without that file, and
     # then `mc` is not shipped at all. See docs/boss-loot.md, "World boss spots".
     curated_pins: dict[int, int] = field(default_factory=dict)
+    # Brief Z5: every area `z` names that the baseline's AreaTable does not, in id order: the
+    # instances add_zones names and the outdoor zones add_forever_zones names. Written only by
+    # mark_forever_areas; empty without a baseline AreaTable, and then `zf` is not shipped.
+    forever_areas: list[int] = field(default_factory=list)
     # An object name's index into `s` -> the category its rows are filed under (8 herb, 9 vein,
     # 10 fishing pool, 11 chest), for every name `op` carries.
     object_kinds: dict[int, int] = field(default_factory=dict)
@@ -1093,6 +1097,8 @@ class EraSources:
         }
         if self.curated_pins:
             value["mc"] = dict(self.curated_pins)
+        if self.forever_areas:
+            value["zf"] = list(self.forever_areas)
         if generated:
             value["g"] = generated
         return value
@@ -1101,17 +1107,11 @@ class EraSources:
 # ----- fetching and verifying the pinned files -----------------------------------------------
 
 
-def add_zones(table: EraSources, areas: Iterable[int], names: Mapping[int, str]) -> list[int]:
-    """Brief Z4 (2026-10-01): give `z` an entry for each of `areas` it does not already name, the
-    name read from `names` (THIS build's own AreaTable), and return the areas added in id order.
-
-    What calls it is boss_loot.apply_instance_zones, with the Boss loot places new in Forever: an
-    instance the Classic Era databases never knew holds no row and no pin, so nothing else in the
-    table names its area, and the addon could neither open nor find it as a zone. Nothing else
-    moves: a name `s` already holds is reused, and a new one is APPENDED after every other string,
-    so no index already handed out changes (`r`, `mp`, `op` and every other table keyed by a
-    string index are byte for byte what they were). No `zm` entry: an instance has no map. An area
-    `names` does not name, or names with an empty string, is skipped."""
+def _name_areas(table: EraSources, areas: Iterable[int], names: Mapping[int, str]) -> list[int]:
+    """Give `z` an entry for each of `areas` it does not already name, the name read from `names`
+    (THIS build's own AreaTable), and return the areas added in id order. A name `s` already holds
+    is reused, and a new one is APPENDED after every other string, so no index already handed out
+    changes. An area `names` does not name, or names with an empty string, is skipped."""
     held = {value: index for index, value in enumerate(table.strings, start=1)}
     added: list[int] = []
     for area in sorted(set(areas)):
@@ -1129,8 +1129,120 @@ def add_zones(table: EraSources, areas: Iterable[int], names: Mapping[int, str])
         table.areas = dict(sorted(table.areas.items()))
         table.counts["areas"] = len(table.areas)
         table.counts["strings"] = len(table.strings)
+    return added
+
+
+def add_zones(table: EraSources, areas: Iterable[int], names: Mapping[int, str]) -> list[int]:
+    """Brief Z4 (2026-10-01): give `z` an entry for each of `areas` it does not already name, the
+    name read from `names` (THIS build's own AreaTable), and return the areas added in id order.
+
+    What calls it is boss_loot.apply_instance_zones, with the Boss loot places new in Forever: an
+    instance the Classic Era databases never knew holds no row and no pin, so nothing else in the
+    table names its area, and the addon could neither open nor find it as a zone. Nothing else
+    moves: a name `s` already holds is reused, and a new one is APPENDED after every other string,
+    so no index already handed out changes (`r`, `mp`, `op` and every other table keyed by a
+    string index are byte for byte what they were). No `zm` entry: an instance has no map. An area
+    `names` does not name, or names with an empty string, is skipped."""
+    added = _name_areas(table, areas, names)
+    if added:
         table.counts["areasWithNoMap"] = len(table.areas) - len(table.area_maps)
     table.counts["foreverInstanceAreas"] = table.counts.get("foreverInstanceAreas", 0) + len(added)
+    return added
+
+
+def forever_zone_areas(
+    new: Collection[int], world_roots: Collection[int], maps: Mapping[int, int]
+) -> list[int]:
+    """Brief Z5 (2026-10-01): the outdoor zones new in Forever, in id order. An area is one when it
+    is new (absent from the baseline's AreaTable), a world root (ParentAreaID 0 on a map whose
+    `InstanceType` is 0, see world_root_areas) and this build draws it on a zone kind UiMap
+    (`maps`, the area_maps answer `zm` already uses). The last test is what leaves the test,
+    unused and prototype rows out; the second leaves out instances and battlegrounds."""
+    roots = set(world_roots)
+    return sorted(area for area in set(new) if area in roots and maps.get(area))
+
+
+def add_forever_zones(
+    table: EraSources, areas: Iterable[int], names: Mapping[int, str], maps: Mapping[int, int]
+) -> list[int]:
+    """Brief Z5 (2026-10-01): name each of `areas` (forever_zone_areas) in `z`, with its map in
+    `zm`, and return the areas added in id order. Forever's own outdoor zones, Zephras Isle among
+    them, hold no Era row and no pin, so without this the addon could neither open nor find them.
+    The same append rule as add_zones: no index already handed out moves, so `r`, `mp` and `op`
+    are byte for byte what they were. An area with no map in `maps` is skipped."""
+    added = _name_areas(table, (area for area in areas if maps.get(area)), names)
+    for area in added:
+        table.area_maps[area] = maps[area]
+    if added:
+        table.area_maps = dict(sorted(table.area_maps.items()))
+        table.counts["areaMaps"] = len(table.area_maps)
+        table.counts["areasWithNoMap"] = len(table.areas) - len(table.area_maps)
+    table.counts["foreverZoneAreas"] = table.counts.get("foreverZoneAreas", 0) + len(added)
+    return added
+
+
+def mark_forever_areas(table: EraSources, new: Collection[int]) -> list[int]:
+    """Brief Z5: set `zf`, every area `z` names that is in `new` (absent from the baseline's
+    AreaTable), in id order, so the addon can say New without reading the Boss loot index. Called
+    after add_zones and add_forever_zones, so it lists both kinds."""
+    fresh = set(new)
+    table.forever_areas = sorted(area for area in table.areas if area in fresh)
+    table.counts["foreverAreas"] = len(table.forever_areas)
+    return table.forever_areas
+
+
+def new_area_ids(conn: sqlite3.Connection, build: str, baseline: str) -> set[int]:
+    """Brief Z5: the AreaTable ids THIS build has and the baseline does not. Empty when the two are
+    the same build, or when either has no AreaTable rows loaded, because then nothing can be
+    called new."""
+    if build == baseline:
+        return set()
+
+    def ids(of: str) -> set[int]:
+        try:
+            rows = conn.execute("SELECT ID FROM AreaTable WHERE build_id = ?", (of,)).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {int(row["ID"]) for row in rows}
+
+    mine, theirs = ids(build), ids(baseline)
+    if not mine or not theirs:
+        return set()
+    return mine - theirs
+
+
+def world_root_areas(conn: sqlite3.Connection, build: str) -> set[int]:
+    """Brief Z5: the areas THIS build states with ParentAreaID 0 whose ContinentID is a map this
+    build's `Map` table carries with `InstanceType` 0 (MAP_INSTANCE_TYPE_WORLD, the open world).
+    An area on a map the table does not carry is not one. Empty when either table is missing."""
+    try:
+        world = {
+            int(row["ID"])
+            for row in conn.execute("SELECT ID, InstanceType FROM Map WHERE build_id = ?", (build,))
+            if int(row["InstanceType"] or 0) == MAP_INSTANCE_TYPE_WORLD
+        }
+        rows = conn.execute(
+            "SELECT ID, ParentAreaID, ContinentID FROM AreaTable WHERE build_id = ?", (build,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {
+        int(row["ID"])
+        for row in rows
+        if not int(row["ParentAreaID"] or 0) and int(row["ContinentID"] or 0) in world
+    }
+
+
+def apply_forever_zones(
+    table: EraSources, era_input: EraInput, conn: sqlite3.Connection, build: str, baseline: str
+) -> list[int]:
+    """Brief Z5: the compile's one call, after boss_loot.apply_instance_zones. Names the outdoor
+    zones new in Forever with their maps (add_forever_zones), then sets `zf` over everything `z`
+    names that is new (mark_forever_areas). Returns the zones added."""
+    new = new_area_ids(conn, build, baseline)
+    areas = forever_zone_areas(new, world_root_areas(conn, build), era_input.area_maps)
+    added = add_forever_zones(table, areas, era_input.areas, era_input.area_maps)
+    mark_forever_areas(table, new)
     return added
 
 
@@ -4730,6 +4842,17 @@ def header_lines(table: EraSources) -> list[str]:
             f" z also names {counts['foreverInstanceAreas']} instances new in Forever (the Boss loot "
             "places), which carry no row and no pin."
             if counts.get("foreverInstanceAreas")
+            else ""
+        )
+        + (
+            f" z also names {counts['foreverZoneAreas']} outdoor zones new in Forever, each with "
+            "its map in zm and no row or pin."
+            if counts.get("foreverZoneAreas")
+            else ""
+        )
+        + (
+            f" zf lists the {counts['foreverAreas']} areas z names that are new in Forever."
+            if counts.get("foreverAreas")
             else ""
         ),
     ]
