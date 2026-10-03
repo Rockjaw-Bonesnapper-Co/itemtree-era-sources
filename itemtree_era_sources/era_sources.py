@@ -42,6 +42,12 @@ never the quest's text; an item this build does not ship is refused as a row for
 A `qr` quest nothing else titles gets its title in `qt`: an index into `s` where `s` holds the
 string, and otherwise the title itself as a plain string, so `s` never grows for `qr`.
 
+Since 2026-10-03 (brief QN1, on the owner's ruling of 2026-10-03: "I want numerals on classic
+quests too") three more `quest_template` columns are read, `PrevQuestId`, `NextQuestId` and
+`NextQuestInChain`, the chain links, ids only. Where two or more quests of one chain share a
+title, each ships its position in the chain and the chain's length in `qc`, so the addon can say
+"Taming the Beast (II)". Same titled quests the links do not join get nothing (see quest_chains).
+
 Since 2026-09-29 (brief W15, owner QA of 2026-09-29: "Quest: Deviate Hides (1486)" showed no
 giver) every creature `creature_questrelation` or `creature_involvedrelation` names for a titled
 quest ships as a name of its own, even where it drops, sells and trains nothing: its name in
@@ -986,6 +992,10 @@ class EraInput:
     quest_starts: list[tuple[int, int]] = field(default_factory=list)
     quest_ends: list[tuple[int, int]] = field(default_factory=list)
     quest_names: dict[int, str] = field(default_factory=dict)
+    # Brief QN1 (the owner's ruling of 2026-10-03): quest_template's three chain link columns,
+    # questId -> (PrevQuestId, NextQuestId, NextQuestInChain), for every entry with one non zero.
+    # Ids only. Read to number the quests of one chain that share a title (quest_chains).
+    quest_links: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     # Brief T1: FactionTemplate id -> the side it resolves to (FACTION_ALLIANCE, FACTION_HORDE or
     # FACTION_BOTH), from THIS build's own FactionTemplate and Faction tables by faction_sides.
     # A template this build does not carry has no entry, and a creature on it gets no `cf`.
@@ -1058,6 +1068,9 @@ class EraSources:
     # Brief W12: questId -> the items it asks the player to bring with their counts, packed by
     # pack_requires, for every kept quest that asks for an item this build ships.
     quest_requires: dict[int, str] = field(default_factory=dict)
+    # Brief QN1: questId -> (c, cl), its position in a chain of quests that share its title and
+    # the chain's length, for every quest quest_chains numbers. Shipped as `qc`.
+    quest_chains: dict[int, tuple[int, int]] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
     # Brief W20, for the compile report and never shipped: shipped pins and path points inside
@@ -1099,6 +1112,8 @@ class EraSources:
             value["mc"] = dict(self.curated_pins)
         if self.forever_areas:
             value["zf"] = list(self.forever_areas)
+        if self.quest_chains:
+            value["qc"] = {quest: {"c": c, "cl": cl} for quest, (c, cl) in self.quest_chains.items()}
         if generated:
             value["g"] = generated
         return value
@@ -1767,6 +1782,10 @@ def _absorb(
             era.quest_ids.add(qid)
             if title:
                 era.quest_names[qid] = title
+            # Brief QN1, the owner's ruling of 2026-10-03: the chain link columns, ids only.
+            links = (_int(col("PrevQuestId")), _int(col("NextQuestId")), _int(col("NextQuestInChain")))
+            if any(links):
+                era.quest_links[qid] = links
         fixed: list[int] = []
         for key in ("RewItemId1", "RewItemId2", "RewItemId3", "RewItemId4"):
             value = _int(col(key))
@@ -4488,6 +4507,15 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
             by_string += 1
     counts["questRequiresTitlesByIndex"] = by_index
     counts["questRequiresTitlesByString"] = by_string
+    # Brief QN1: the quests of one chain that share a title, numbered by chain position.
+    chains = quest_chains(era_input.quest_names, era_input.quest_links, era_input.quest_ids)
+    agree, disagree = chains.id_order_check()
+    counts["questChains"] = len(chains.chains)
+    counts["questChainQuests"] = len(chains.numbers)
+    counts["questChainsBranched"] = chains.branched
+    counts["questChainsIdOrderAgrees"] = agree
+    counts["questChainsIdOrderDisagrees"] = len(disagree)
+    counts["questsSameTitleUnlinked"] = chains.unlinked
 
     # Brief W15: the names a list record packs go first, so their two digit field always fits.
     listed_names = {
@@ -4616,6 +4644,7 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         factions=dict(sorted(sides.items())),
         trainers=dict(sorted(trainers_out.items())),
         quest_requires={quest: pack_requires(pairs) for quest, pairs in sorted(requires.items())},
+        quest_chains=chains.numbers,
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -4625,6 +4654,152 @@ def derive(era_input: EraInput, graph: BuildFacts, *, withheld: Collection[int] 
         zone_overlaps=overlaps,
         zone_moves=moved,
     )
+
+
+# ----- the quest chains (brief QN1) ---------------------------------------------------------------
+
+
+@dataclass
+class QuestChains:
+    """What quest_chains finds: the numbers to ship and what the id order check needs.
+
+    `numbers` is questId -> (c, cl), its 1 based position in its chain and the chain's length.
+    `chains` is every numbered chain as its positions in order, each position a tuple of the
+    quest ids standing there in id order (two or more only where the links branch). `unlinked`
+    counts the titled quests that share a title with another and are linked to none of them,
+    `branched` the numbered chains with a position held by two or more quests, and `cyclic` the
+    groups whose links loop, which are left unnumbered.
+    """
+
+    numbers: dict[int, tuple[int, int]] = field(default_factory=dict)
+    chains: list[tuple[tuple[int, ...], ...]] = field(default_factory=list)
+    unlinked: int = 0
+    branched: int = 0
+    cyclic: int = 0
+
+    def id_order_agrees(self, chain: Sequence[Sequence[int]]) -> bool:
+        """Whether ascending quest id gives the links' order: every quest at an earlier position
+        has a smaller id than every quest at a later one."""
+        return all(max(chain[n]) < min(chain[n + 1]) for n in range(len(chain) - 1))
+
+    def id_order_check(self) -> tuple[int, list[tuple[int, ...]]]:
+        """The chains id order agrees with, by count, and the ids of each one it does not, in the
+        links' order (ids only)."""
+        agree = 0
+        disagree: list[tuple[int, ...]] = []
+        for chain in self.chains:
+            if self.id_order_agrees(chain):
+                agree += 1
+            else:
+                disagree.append(tuple(quest for position in chain for quest in position))
+        return agree, disagree
+
+
+def quest_chains(
+    names: Mapping[int, str],
+    links: Mapping[int, tuple[int, int, int]],
+    quest_ids: Collection[int] = (),
+) -> QuestChains:
+    """Number the quests of one chain that share a title (brief QN1, the owner's ruling of 2026-10-03).
+
+    Reads `quest_template`'s three chain link columns and nothing else of the chain: `PrevQuestId`
+    (positive: the quest this one needs done first), `NextQuestId` (positive: the quest that needs
+    this one done first) and `NextQuestInChain` (the quest the client offers next). Each positive
+    one is a link from the earlier quest to the later; a negative `PrevQuestId` or `NextQuestId`
+    (a quest that must be in the log at the same time) is not a step and is not followed. A link
+    to an id `quest_template` does not hold is dropped. `names` is the titles (`quest_names`),
+    `links` questId -> (PrevQuestId, NextQuestId, NextQuestInChain) and `quest_ids` every entry,
+    so a link may pass through an untitled quest (empty: every id `names` or `links` holds).
+
+    Two quests of one title are in one chain when either reaches the other through the links,
+    whatever titles stand between them. A chain's position for a quest is the longest run of its
+    same titled chain mates that lead to it, so a straight chain reads 1, 2, 3 and two quests
+    that are alternatives at one step (one per race, say) share a number. A same titled quest
+    linked to none of the others is not numbered: that is the zone suffix's case, the addon's.
+    Pure.
+    """
+    known = set(quest_ids) or (set(names) | set(links))
+    succ: dict[int, set[int]] = defaultdict(set)
+    for quest, (prev, nxt, in_chain) in links.items():
+        if quest not in known:
+            continue
+        if prev > 0 and prev in known and prev != quest:
+            succ[prev].add(quest)
+        for later in (nxt, in_chain):
+            if later > 0 and later in known and later != quest:
+                succ[quest].add(later)
+
+    def reach(start: int) -> set[int]:
+        seen: set[int] = set()
+        stack = [start]
+        while stack:
+            for later in succ.get(stack.pop(), ()):
+                if later not in seen:
+                    seen.add(later)
+                    stack.append(later)
+        return seen
+
+    by_title: dict[str, list[int]] = defaultdict(list)
+    for quest, title in names.items():
+        if title.strip():
+            by_title[title.strip()].append(quest)
+    out = QuestChains()
+    parent: dict[int, int] = {}
+
+    def root(quest: int) -> int:
+        while parent[quest] != quest:
+            parent[quest] = parent[parent[quest]]
+            quest = parent[quest]
+        return quest
+
+    for title in sorted(by_title):
+        quests = sorted(by_title[title])
+        if len(quests) < 2:
+            continue
+        reached = {quest: reach(quest) & set(quests) for quest in quests}
+        # One chain per set of quests the links join, either way round.
+        parent.clear()
+        parent.update({quest: quest for quest in quests})
+        for quest in quests:
+            for later in reached[quest]:
+                parent[root(later)] = root(quest)
+        groups: dict[int, list[int]] = defaultdict(list)
+        for quest in quests:
+            groups[root(quest)].append(quest)
+        for members in sorted(groups.values()):
+            if len(members) < 2:
+                out.unlinked += 1
+                continue
+            if any(quest in reached[quest] for quest in members):
+                out.cyclic += 1
+                continue
+            before = {quest: {other for other in members if quest in reached[other]} for quest in members}
+            depth: dict[int, int] = {}
+            for quest in sorted(members, key=lambda q: (len(before[q]), q)):
+                depth[quest] = max((depth[other] + 1 for other in before[quest]), default=0)
+            length = max(depth.values()) + 1
+            positions = tuple(tuple(sorted(q for q in members if depth[q] == step)) for step in range(length))
+            out.chains.append(positions)
+            if any(len(position) > 1 for position in positions):
+                out.branched += 1
+            for quest in members:
+                out.numbers[quest] = (depth[quest] + 1, length)
+    out.numbers = dict(sorted(out.numbers.items()))
+    return out
+
+
+def quest_chain_report(chains: QuestChains) -> list[str]:
+    """The `era-quest-chains` command's lines: the chains found and the id order check, ids only."""
+    agree, disagree = chains.id_order_check()
+    lines = [
+        f"{len(chains.chains)} chains numbered over {len(chains.numbers)} quests "
+        f"({chains.branched} with a step two or more quests share), "
+        f"{chains.unlinked} same titled quests linked to none of their title, "
+        f"{chains.cyclic} looped groups left unnumbered",
+        f"id order agrees with the links on {agree} chains and disagrees on {len(disagree)}",
+    ]
+    lines += [" ".join(str(quest) for quest in ids) for ids in disagree]
+    return lines
 
 
 # ----- the header the module carries -------------------------------------------------------------
@@ -4651,6 +4826,7 @@ def header_lines(table: EraSources) -> list[str]:
         "qr = { [questId] = packed required items }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
         + ("mc = { [string index] = count }, " if table.curated_pins else "")
+        + ("qc = { [questId] = { c = position, cl = chain length } }, " if table.quest_chains else "")
         + "g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
@@ -4787,6 +4963,17 @@ def header_lines(table: EraSources) -> list[str]:
         "(or withholds); a quest asking for none of them has no entry. An item's Used by quests "
         "are the quests whose record holds it. Every quest here is titled by a c=3 row or by qt "
         "(as an index or as a plain string; s gains no string for qr).",
+        *(
+            [
+                "qc: the quests of one chain that share a title (quest_template.PrevQuestId, "
+                "NextQuestId and NextQuestInChain), keyed by quest id: c its 1 based position in "
+                "the chain, cl the chain's length. Same titled quests the links do not join have "
+                f"no entry. {counts.get('questChains', 0)} chains over "
+                f"{counts.get('questChainQuests', 0)} quests.",
+            ]
+            if table.quest_chains
+            else []
+        ),
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "
         "searched. x[itemId][c] is a 1 based number into xl, and xl holds each distinct list "
         "once. A list is a run of fixed width records of base 91 digits (the bytes 35 to 126 "

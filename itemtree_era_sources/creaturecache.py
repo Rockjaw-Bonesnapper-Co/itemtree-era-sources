@@ -192,8 +192,8 @@ def parse(data: bytes, *, build: int | None = None, also: Collection[int] = ()) 
 
 def read(path: Path, *, build: str | None = None, same_tables: Collection[str] = ()) -> CreatureCache:
     """Read the file. `build` is the compile's build id. A cache of any other build is refused,
-    unless that build is one of `same_tables`: the builds whose manifests record the same sha256
-    for every table as `build`'s (manifest.same_tables_builds, brief W21)."""
+    unless that build is one of `same_tables`: the builds whose manifests record the same tables
+    as `build`'s, by sha256 or by rows (manifest.same_tables_builds, briefs W21 and W34)."""
     try:
         data = path.read_bytes()
     except OSError as exc:
