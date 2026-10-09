@@ -1033,6 +1033,18 @@ class EraInput:
     trainer_spells: list[tuple[int, int]] = field(default_factory=list)
     trainer_template_spells: list[tuple[int, int]] = field(default_factory=list)
     learned_spells: dict[int, int] = field(default_factory=dict)
+    # Brief Q1: `game_event_quest`, questId -> the game events it belongs to, ascending (ids only;
+    # quest_events reads it), and the reputation turn ins (quest_turn_ins).
+    quest_event_links: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    quest_turn_ins: set[int] = field(default_factory=set)
+    # Brief Q1 (the owner's ruling of 2026-10-09): quest_template's QuestLevel and MinLevel,
+    # questId -> (level, minimum level), for every entry stating either (a level below 1 reads 0).
+    quest_levels: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Brief INT1b (the owner's ruling of 2026-10-10, Q(b)): the classes a quest is for, questId ->
+    # class mask, quest_template's RequiredClasses joined with its ZoneOrSort where that is a class
+    # sort (QUEST_SORT_CLASSES), both signals, union. Only the quests restricted to some playable
+    # classes and not all of them (quest_class_mask).
+    quest_classes: dict[int, int] = field(default_factory=dict)
 
 
 # ----- the CMaNGOS only input (brief GA1) ------------------------------------------------------
@@ -1077,6 +1089,10 @@ CMANGOS_FIELDS = frozenset(
         "trainer_spells",
         "trainer_template_spells",
         "learned_spells",
+        "quest_event_links",
+        "quest_turn_ins",
+        "quest_levels",
+        "quest_classes",
     }
 )
 # Read out of the two pinned pfQuest files, which give the area id a spawn is in and nothing else.
@@ -1203,6 +1219,13 @@ class EraSources:
     # Brief QN1: questId -> (c, cl), its position in a chain of quests that share its title and
     # the chain's length, for every quest quest_chains numbers. Shipped as `qc`.
     quest_chains: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Brief Q1: questId -> the game event it belongs to (quest_events). Shipped as `qe`.
+    quest_events: dict[int, int] = field(default_factory=dict)
+    # Brief Q1: questId -> its level and minimum level, packed (pack_quest_level). Shipped as `ql`.
+    quest_levels: dict[int, int] = field(default_factory=dict)
+    # Brief INT1b (the owner's ruling of 2026-10-10): questId -> the class mask of a class restricted
+    # quest (quest_class_mask). Shipped as `qa`, beside an item row's `ac` (its allowed classes).
+    quest_classes: dict[int, int] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
     # Brief EK1, for the caller that places the names (never shipped): which names the table opens
@@ -1246,6 +1269,12 @@ class EraSources:
         }
         if self.quest_chains:
             value["qc"] = {quest: {"c": c, "cl": cl} for quest, (c, cl) in self.quest_chains.items()}
+        if self.quest_events:
+            value["qe"] = dict(self.quest_events)
+        if self.quest_levels:
+            value["ql"] = dict(self.quest_levels)
+        if self.quest_classes:
+            value["qa"] = dict(self.quest_classes)
         if generated:
             value["g"] = generated
         check_gpl_value(value, self.blank)
@@ -1254,7 +1283,9 @@ class EraSources:
 
 # Brief GA1: the keys EraSources.lua (GPL-3.0) may hold, and nothing else. Each is read out of the
 # pinned CMaNGOS dump (or pfQuest's area ids inside `r` and `xl`), selected, ordered and packed.
-GPL_FIELDS = frozenset({"s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "st", "tr", "qr", "qc", "x", "xl", "g"})
+GPL_FIELDS = frozenset(
+    {"s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "st", "tr", "qr", "qc", "qe", "ql", "qa", "x", "xl", "g"}
+)
 # The keys a packed module adds beside them (pack_module).
 GPL_PACKING_FIELDS = frozenset({"legend", "packed"})
 
@@ -1402,6 +1433,8 @@ WANTED_TABLES = (
     "npc_trainer",
     "npc_trainer_template",
     "spell_template",
+    # Brief Q1: which game event a quest belongs to. Two columns, both ids.
+    "game_event_quest",
 )
 
 LOOT_TABLES = {
@@ -1792,6 +1825,13 @@ def _absorb(
         pair = (_int(col("id")), _int(col("quest")))
         (era.quest_starts if table == "creature_questrelation" else era.quest_ends).append(pair)
         return
+    if table == "game_event_quest":
+        # Brief Q1: a quest and a game event it belongs to, two ids.
+        quest = _int(col("quest"))
+        era.quest_event_links[quest] = tuple(
+            sorted({*era.quest_event_links.get(quest, ()), _int(col("event"))})
+        )
+        return
     if table == "quest_template":
         qid = _int(col("entry"))
         title = (col("Title") or "").strip()
@@ -1816,6 +1856,15 @@ def _absorb(
         items: list[int] = fixed + choices
         if qid > 0 and items:
             era.quest_rewards[qid] = (tuple(dict.fromkeys(fixed)), tuple(dict.fromkeys(choices)))
+        # Brief Q1: a reputation turn in (is_turn_in), an id only; and the quest's two levels.
+        if qid > 0 and is_turn_in(col, items):
+            era.quest_turn_ins.add(qid)
+        if qid > 0 and (_int(col("QuestLevel")) > 0 or _int(col("MinLevel")) > 0):
+            era.quest_levels[qid] = (max(0, _int(col("QuestLevel"))), max(0, _int(col("MinLevel"))))
+        # Brief INT1b (the owner's ruling of 2026-10-10): the classes the quest is for, a mask.
+        classes = quest_class_mask(_int(col("RequiredClasses")), _int(col("ZoneOrSort")))
+        if qid > 0 and classes:
+            era.quest_classes[qid] = classes
         requires: list[int] = []
         require_counts: list[int] = []
         for number in range(1, 5):
@@ -3462,6 +3511,12 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     counts["questChainsIdOrderAgrees"] = agree
     counts["questChainsIdOrderDisagrees"] = len(disagree)
     counts["questsSameTitleUnlinked"] = chains.unlinked
+    # Brief Q1: the quests tied to a game event, and the quests' levels.
+    events = quest_events(era_input)
+    counts["questEvents"] = len(events)
+    counts["questLevels"] = len(era_input.quest_levels)
+    # Brief INT1b: the class restricted quests.
+    counts["questClasses"] = len(era_input.quest_classes)
 
     # Brief W15: the names a list record packs go first, so their two digit field always fits.
     listed_names = {
@@ -3572,6 +3627,11 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         trainers=dict(sorted(trainers_out.items())),
         quest_requires={quest: pack_requires(pairs) for quest, pairs in sorted(requires.items())},
         quest_chains=chains.numbers,
+        quest_events=events,
+        quest_levels={
+            quest: pack_quest_level(*pair) for quest, pair in sorted(era_input.quest_levels.items())
+        },
+        quest_classes=dict(sorted(era_input.quest_classes.items())),
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -3730,6 +3790,102 @@ def quest_chain_report(chains: QuestChains) -> list[str]:
     return lines
 
 
+# ----- the event quests and the reputation turn ins (brief Q1) -----------------------------------
+#
+# The owner's rulings of 2026-10-09: a quest tied to a game event (the Ahn'Qiraj War Effort, a
+# holiday, any event) never keeps an item and its Used by row says "Event"; a reputation turn in
+# (cloth donations and the like) never keeps one either. Both are the dump's own facts, ids only.
+
+# quest_template.SpecialFlags: the quest can be done again.
+QUEST_SPECIAL_REPEATABLE = 1
+# Brief Q1 (the owner's ruling of 2026-10-09): `ql` packs a quest's level and minimum level into one
+# whole number, level + QL_LEVEL_SPAN * minimum level (no Classic quest level reaches 128).
+QL_LEVEL_SPAN = 128
+# quest_template.Method 0: a plain hand in, completed at the giver with no quest log step.
+QUEST_METHOD_HAND_IN = 0
+
+# Brief INT1b (the owner's ruling of 2026-10-10, Q(b)): a class quest keeps an item only for a
+# character of one of its classes. The class mask bits run by class id (bit = 2 ^ (id - 1)): 1
+# Warrior, 2 Paladin, 4 Hunter, 8 Rogue, 16 Priest, 64 Shaman, 128 Mage, 256 Warlock, 1024 Druid,
+# the nine playable classes, CLASS_MASK_PLAYABLE in all.
+CLASS_MASK_PLAYABLE = 1 | 2 | 4 | 8 | 16 | 64 | 128 | 256 | 1024
+# quest_template.ZoneOrSort below 0 is a quest sort; these nine are the class sorts, each with the one
+# class mask bit it stands for. Checked against the pinned dump (every quest filed under each sort
+# states exactly that RequiredClasses mask: -61 94 quests, -81 72, -82 42, -141 58, -161 46, -162 54,
+# -261 44, -262 59, -263 38) and against the sorts' own names in the client's QuestSort table.
+QUEST_SORT_CLASSES = {
+    -61: 256,  # Warlock
+    -81: 1,  # Warrior
+    -82: 64,  # Shaman
+    -141: 2,  # Paladin
+    -161: 128,  # Mage
+    -162: 8,  # Rogue
+    -261: 4,  # Hunter
+    -262: 16,  # Priest
+    -263: 1024,  # Druid
+}
+
+
+def quest_class_mask(required_classes: int, zone_or_sort: int) -> int:
+    """The classes one quest is for, as a class mask: its RequiredClasses joined with the class its
+    ZoneOrSort names where that is a class sort (both signals, union), the playable classes' bits
+    only. 0, no restriction, where neither names a class or the two together name every playable
+    class."""
+    mask = (max(0, required_classes) | QUEST_SORT_CLASSES.get(zone_or_sort, 0)) & CLASS_MASK_PLAYABLE
+    if mask == CLASS_MASK_PLAYABLE:
+        return 0
+    return mask
+
+
+def is_turn_in(col: Callable[[str], str | None], items: Sequence[int]) -> bool:
+    """Whether one quest_template row is a reputation turn in: flagged repeatable (SpecialFlags, the
+    battleground mark and faction turn ins among them, which state their reputation elsewhere), or a
+    plain hand in (Method 0) that rewards reputation (a RewRepFaction with a positive value) and no
+    item. `col` reads the row's columns; `items` are its reward and choice item ids. The second half
+    is what takes in the one time cloth donations, which the dump does not flag."""
+    if _int(col("SpecialFlags")) & QUEST_SPECIAL_REPEATABLE:
+        return True
+    if _int(col("Method"), -1) != QUEST_METHOD_HAND_IN or items:
+        return False
+    return any(_int(col(f"RewRepFaction{n}")) > 0 and _int(col(f"RewRepValue{n}")) > 0 for n in range(1, 6))
+
+
+def pack_quest_level(level: int, minimum: int) -> int:
+    """A quest's `ql` value: its QuestLevel plus QL_LEVEL_SPAN times its MinLevel, each 0 where the
+    dump states none."""
+    if not 0 <= level < QL_LEVEL_SPAN or not 0 <= minimum < QL_LEVEL_SPAN:
+        raise EraSourcesError(f"a quest level of {level} or a minimum of {minimum} does not pack")
+    return level + QL_LEVEL_SPAN * minimum
+
+
+def quest_events(era_input: CmangosFacts) -> dict[int, int]:
+    """questId -> the game event it belongs to, the lowest event id where it belongs to several,
+    in quest id order: every quest `game_event_quest` names, and every quest whose givers the dump
+    spawns only while a game event runs (each of them has a `creature` row, and every row of each
+    has a positive `game_event_creature` event). The givers are the creatures that start it, or
+    for a quest no creature starts, the creatures that end it (a Darkmoon Faire deck). The AQ War
+    Effort's item collection quests are the second kind: their giver stands only in event 120."""
+    events: dict[int, set[int]] = defaultdict(set)
+    for quest, linked in era_input.quest_event_links.items():
+        events[quest].update(event for event in linked if event > 0)
+    spawned: dict[int, set[int]] = defaultdict(set)
+    for spawn in era_input.spawns:
+        for creature in (spawn.creature,) if spawn.creature else era_input.spawn_entries.get(spawn.guid, ()):
+            spawned[creature].add(spawn.event)
+    starts: dict[int, set[int]] = defaultdict(set)
+    ends: dict[int, set[int]] = defaultdict(set)
+    for creature, quest in era_input.quest_starts:
+        starts[quest].add(creature)
+    for creature, quest in era_input.quest_ends:
+        ends[quest].add(creature)
+    for quest in set(starts) | set(ends):
+        givers = starts.get(quest) or ends.get(quest) or set()
+        seen = [spawned.get(creature, set()) for creature in givers]
+        if givers and all(rows and min(rows) > 0 for rows in seen):
+            events[quest].update(*seen)
+    return {quest: min(found) for quest, found in sorted(events.items()) if found and quest > 0}
+
+
 # ----- the header the module carries -------------------------------------------------------------
 
 
@@ -3758,6 +3914,9 @@ def header_lines(table: EraSources) -> list[str]:
         "qr = { [questId] = packed required items }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
         + ("qc = { [questId] = { c = position, cl = chain length } }, " if table.quest_chains else "")
+        + ("qe = { [questId] = game event id }, " if table.quest_events else "")
+        + ("ql = { [questId] = level + 128 * minimum level }, " if table.quest_levels else "")
+        + ("qa = { [questId] = class mask }, " if table.quest_classes else "")
         + "legend = { {field, type}, ... }, packed = 1, g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
@@ -3872,6 +4031,38 @@ def header_lines(table: EraSources) -> list[str]:
                 f"{counts.get('questChainQuests', 0)} quests.",
             ]
             if table.quest_chains
+            else []
+        ),
+        *(
+            [
+                "qe: the quests tied to a game event (a holiday, the Ahn'Qiraj War Effort, the "
+                "Darkmoon Faire), keyed by quest id: the game_event entry it belongs to, the lowest "
+                "where several. A quest game_event_quest names, or one whose givers (the creatures "
+                "that start it, else those that end it) are spawned only while an event runs: every "
+                "creature row of each has a positive game_event_creature event. "
+                f"{counts.get('questEvents', 0)} quests.",
+            ]
+            if table.quest_events
+            else []
+        ),
+        *(
+            [
+                "ql: a quest's level and the level it can be taken from (quest_template.QuestLevel and "
+                f"MinLevel), keyed by quest id: level + {QL_LEVEL_SPAN} * minimum level, 0 for a level the "
+                f"dump does not state. {counts.get('questLevels', 0)} quests.",
+            ]
+            if table.quest_levels
+            else []
+        ),
+        *(
+            [
+                "qa: the classes a class quest is for, keyed by quest id: a class mask (1 Warrior, 2 "
+                "Paladin, 4 Hunter, 8 Rogue, 16 Priest, 64 Shaman, 128 Mage, 256 Warlock, 1024 Druid), "
+                "quest_template.RequiredClasses joined with the class its ZoneOrSort names where that "
+                "is a class sort. Only a quest some classes cannot do. "
+                f"{counts.get('questClasses', 0)} quests.",
+            ]
+            if table.quest_classes
             else []
         ),
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "

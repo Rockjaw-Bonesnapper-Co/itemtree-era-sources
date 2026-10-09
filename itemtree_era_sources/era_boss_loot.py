@@ -23,6 +23,9 @@ so the file is the same whatever the client build, the curated files or the crea
   * a creature `instance_encounters` credits for an encounter kill (a boss summoned mid fight has
     no spawn at all);
   * a creature of rank 3 (a boss), wherever it stands (the world bosses);
+  * a creature a trigger summons (trigger_bosses: "Kormok Trigger", a creature with no loot whose
+    every always there spawn is on one map that is not a continent, names Kormok, who has loot and
+    no always there spawn but on that map; brief BQ5);
   * a chest (gameobject type 3) with loot whose every spawn is on one map that is not a continent.
 
 A creature or a chest whose name is scaffolding (era_sources.is_scaffolding) is left out, and so is
@@ -151,10 +154,47 @@ def loot_value(drop: era_mod.Drop) -> int:
     return value
 
 
+# The word a summoning trigger's name ends with ("Lord Valthalak Trigger"), and the word that joins
+# two names in one ("Jarien and Sothos Trigger").
+TRIGGER_SUFFIX = " Trigger"
+TRIGGER_JOIN = " and "
+
+
+def trigger_bosses(facts, maps: Mapping[int, frozenset[int]]) -> dict[int, tuple[int, ...]]:
+    """Brief BQ5: trigger creature id -> the creatures it summons, ids ascending. A trigger is a
+    creature with no loot named "<name> Trigger" (or "<name> and <name> Trigger") whose every always
+    there spawn is on ONE map that is not a continent; it summons each creature of exactly such a
+    name that has loot and no always there spawn but on that map (Lord Valthalak Trigger 16048
+    summons Lord Valthalak 16042, Kormok Trigger 16047 Kormok 16118). A CMaNGOS rule alone: names,
+    loot templates and spawns. `facts` is a CmangosOnly or an EraInput: `creatures` is read."""
+    by_name: dict[str, list[int]] = defaultdict(list)
+    for cid in sorted(facts.creatures):
+        by_name[facts.creatures[cid].name].append(cid)
+    out: dict[int, tuple[int, ...]] = {}
+    for cid in sorted(facts.creatures):
+        trigger = facts.creatures[cid]
+        if trigger.loot or not trigger.name.endswith(TRIGGER_SUFFIX):
+            continue
+        where = maps.get(cid, frozenset())
+        if len(where) != 1 or where <= CONTINENT_MAPS:
+            continue
+        names = trigger.name[: -len(TRIGGER_SUFFIX)].split(TRIGGER_JOIN)
+        summoned = sorted(
+            other
+            for name in names
+            for other in by_name.get(name, ())
+            if other != cid and facts.creatures[other].loot and maps.get(other, where) == where
+        )
+        if summoned:
+            out[cid] = tuple(summoned)
+    return out
+
+
 def kept_creatures(cmangos: era_mod.CmangosOnly, maps: Mapping[int, frozenset[int]]) -> list[int]:
     """The creatures this file holds a list for, by the CMaNGOS rule in the module docstring, in id
     order. Scaffolding and an empty list are left out by `build`."""
     credited = {cid for found in cmangos.credits.values() for cid in found}
+    summoned = {other for found in trigger_bosses(cmangos, maps).values() for other in found}
     kept: list[int] = []
     for cid in sorted(cmangos.creatures):
         facts = cmangos.creatures[cid]
@@ -162,7 +202,7 @@ def kept_creatures(cmangos: era_mod.CmangosOnly, maps: Mapping[int, frozenset[in
             continue
         where = maps.get(cid, frozenset())
         alone = len(where) == 1 and not where <= CONTINENT_MAPS
-        if alone or cid in credited or facts.rank == CMANGOS_BOSS:
+        if alone or cid in credited or cid in summoned or facts.rank == CMANGOS_BOSS:
             kept.append(cid)
     return kept
 
