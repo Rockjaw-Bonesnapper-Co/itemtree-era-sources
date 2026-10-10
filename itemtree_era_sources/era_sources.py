@@ -1857,7 +1857,7 @@ def _absorb(
         if qid > 0 and items:
             era.quest_rewards[qid] = (tuple(dict.fromkeys(fixed)), tuple(dict.fromkeys(choices)))
         # Brief Q1: a reputation turn in (is_turn_in), an id only; and the quest's two levels.
-        if qid > 0 and is_turn_in(col, items):
+        if qid > 0 and is_turn_in(col):
             era.quest_turn_ins.add(qid)
         if qid > 0 and (_int(col("QuestLevel")) > 0 or _int(col("MinLevel")) > 0):
             era.quest_levels[qid] = (max(0, _int(col("QuestLevel"))), max(0, _int(col("MinLevel"))))
@@ -3794,15 +3794,14 @@ def quest_chain_report(chains: QuestChains) -> list[str]:
 #
 # The owner's rulings of 2026-10-09: a quest tied to a game event (the Ahn'Qiraj War Effort, a
 # holiday, any event) never keeps an item and its Used by row says "Event"; a reputation turn in
-# (cloth donations and the like) never keeps one either. Both are the dump's own facts, ids only.
+# (a repeatable cloth donation and the like) never keeps one either. Both are the dump's own facts,
+# ids only.
 
 # quest_template.SpecialFlags: the quest can be done again.
 QUEST_SPECIAL_REPEATABLE = 1
 # Brief Q1 (the owner's ruling of 2026-10-09): `ql` packs a quest's level and minimum level into one
 # whole number, level + QL_LEVEL_SPAN * minimum level (no Classic quest level reaches 128).
 QL_LEVEL_SPAN = 128
-# quest_template.Method 0: a plain hand in, completed at the giver with no quest log step.
-QUEST_METHOD_HAND_IN = 0
 
 # Brief INT1b (the owner's ruling of 2026-10-10, Q(b)): a class quest keeps an item only for a
 # character of one of its classes. The class mask bits run by class id (bit = 2 ^ (id - 1)): 1
@@ -3837,17 +3836,13 @@ def quest_class_mask(required_classes: int, zone_or_sort: int) -> int:
     return mask
 
 
-def is_turn_in(col: Callable[[str], str | None], items: Sequence[int]) -> bool:
+def is_turn_in(col: Callable[[str], str | None]) -> bool:
     """Whether one quest_template row is a reputation turn in: flagged repeatable (SpecialFlags, the
-    battleground mark and faction turn ins among them, which state their reputation elsewhere), or a
-    plain hand in (Method 0) that rewards reputation (a RewRepFaction with a positive value) and no
-    item. `col` reads the row's columns; `items` are its reward and choice item ids. The second half
-    is what takes in the one time cloth donations, which the dump does not flag."""
-    if _int(col("SpecialFlags")) & QUEST_SPECIAL_REPEATABLE:
-        return True
-    if _int(col("Method"), -1) != QUEST_METHOD_HAND_IN or items:
-        return False
-    return any(_int(col(f"RewRepFaction{n}")) > 0 and _int(col(f"RewRepValue{n}")) > 0 for n in range(1, 6))
+    cloth turn ins, the battleground mark and faction turn ins among them, which state their
+    reputation elsewhere). `col` reads the row's columns. Brief BQ27 (the owner's ruling Q6 of
+    2026-10-10): the repeatable flag alone, so a one time hand in (the first cloth donation at each
+    capital, A Donation of Wool among them) is an ordinary quest and keeps its items."""
+    return bool(_int(col("SpecialFlags")) & QUEST_SPECIAL_REPEATABLE)
 
 
 def pack_quest_level(level: int, minimum: int) -> int:
