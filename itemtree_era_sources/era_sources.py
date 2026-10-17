@@ -1082,6 +1082,11 @@ class EraInput:
     # sort (QUEST_SORT_CLASSES), both signals, union. Only the quests restricted to some playable
     # classes and not all of them (quest_class_mask).
     quest_classes: dict[int, int] = field(default_factory=dict)
+    # Brief QS2 (the owner's ruling of 2026-10-13): quest_template's RequiredRaces, questId -> race
+    # mask, for EVERY entry stating one (non zero). `quests` holds the mask only for a quest that
+    # hands over or asks for an item; a quest players recorded in Forever keeps its race mask's side
+    # whatever it hands over. A plain number per quest; no GPL file ships it.
+    quest_races: dict[int, int] = field(default_factory=dict)
 
 
 # ----- the CMaNGOS only input (brief GA1) ------------------------------------------------------
@@ -1132,6 +1137,7 @@ CMANGOS_FIELDS = frozenset(
         "quest_turn_ins",
         "quest_levels",
         "quest_classes",
+        "quest_races",
     }
 )
 # Read out of the two pinned pfQuest files, which give the area id a spawn is in and nothing else.
@@ -1918,6 +1924,10 @@ def _absorb(
         classes = quest_class_mask(_int(col("RequiredClasses")), _int(col("ZoneOrSort")))
         if qid > 0 and classes:
             era.quest_classes[qid] = classes
+        # Brief QS2: every quest's race mask, not only the ones `quests` keeps below.
+        races = _int(col("RequiredRaces"))
+        if qid > 0 and races > 0:
+            era.quest_races[qid] = races
         requires: list[int] = []
         require_counts: list[int] = []
         for number in range(1, 5):
