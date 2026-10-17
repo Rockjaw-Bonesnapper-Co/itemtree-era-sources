@@ -65,7 +65,8 @@ spell id per row), `npc_trainer_template` (a template id and a spell id per row,
 creature through `creature_template.TrainerTemplateId`) and, from `spell_template`, the id, the
 three `Effect` columns and the three `EffectTriggerSpell` columns and nothing else, to turn a
 trainer's "learn" spell into the spell it teaches. Ids only: no spell name, no description, no
-cost, no required level or skill. A taught spell is kept only where the caller's selection keeps
+cost, no required level or skill (brief TR5 since reads the skill rank, and brief CT1 the level and
+the price for the class trainers' `tc`, below). A taught spell is kept only where the caller's selection keeps
 it (BuildFacts.profession_spells: ItemTree keeps the spells THIS build's own `SkillLineAbility`
 files under a profession or secondary skill line, the coordinator's decision on brief P6a: its
 trainer rows are about recipes, a class trainer teaches no item, and the class trainers' 27,038
@@ -80,6 +81,14 @@ that teaches, that the `creature` table spawns and whose TrainerType is a class 
 trainer's ships as a name of its own, with its kind, portrait, title and id (and its side and pins
 in the caller's EraPlaces.lua), so a player can find their class trainer. Its spells stay cut: such
 a name gets no `tr`. A CMaNGOS rule alone; nothing of the caller's chooses these names.
+
+Since brief CT1 (the owner, 2026-10-17: "Let's queue to add the teaches spells for the next
+release") those class trainers' spells ship after all, but in a shape of their own, `tc`, rather
+than back in `tr`: two more columns of `npc_trainer` and `npc_trainer_template` are read, `reqlevel`
+and `spellcost` (the level the trainer asks and the price in copper), and one more of
+`creature_template`, `TrainerClass`. Most class trainers of one class teach the very same list, so
+each distinct list ships once with its class and each class trainer name points at its list. Every
+spell the dump states ships; nothing of the caller's chooses or orders a record.
 
 The map pins and paths are read out of the dump here (the `creature` and `gameobject` positions,
 the waypoints) and placed on a client build's own zone maps by the caller alone: since brief GA1
@@ -542,6 +551,22 @@ TRAINER_TYPE_TRADESKILLS = 2
 TRAINER_TYPE_PETS = 3
 PLACED_TRAINER_TYPES = frozenset({TRAINER_TYPE_CLASS, TRAINER_TYPE_PETS})
 
+# Brief CT1 (the owner, 2026-10-17: "Let's queue to add the teaches spells for the next release"):
+# `tc`, the class spells a class trainer NAME teaches, which the P6a cut keeps out of `tr`. Each
+# distinct list ships once (`l`, most class trainers of one class teach the very same list) with the
+# class it is for (`c`, creature_template.TrainerClass), and each class trainer name points at its
+# list (`n`). A record is the spell (TC_SPELL_DIGITS, the learn spell read as the spell it teaches,
+# as `tr` reads one), the level the trainer asks (npc_trainer.reqlevel, TC_LEVEL_DIGITS: one digit
+# holds 90 and a 1.12 level stops at 60) and the price in copper (npc_trainer.spellcost,
+# TC_COST_DIGITS: three hold 753,570 and the dearest 1.12 class spell is 80,000). The playable class
+# ids TrainerClass names (ChrClasses): a TrainerType 0 creature of any other class teaches nothing
+# that ships here.
+TC_SPELL_DIGITS = 3
+TC_LEVEL_DIGITS = 1
+TC_COST_DIGITS = 3
+TC_RECORD_DIGITS = TC_SPELL_DIGITS + TC_LEVEL_DIGITS + TC_COST_DIGITS
+CLASS_IDS = frozenset({1, 2, 3, 4, 5, 7, 8, 9, 11})
+
 # creature.MovementType 2: the spawn walks its waypoints.
 MOVEMENT_WAYPOINT = 2
 
@@ -633,6 +658,16 @@ def pack_levels(levels: Sequence[int]) -> str:
     """A trainer's learn levels (brief TR5): each as TV_LEVEL_DIGITS base 91 digits, in the order
     of the name's `tr` list."""
     return "".join(pack_int(level, TV_LEVEL_DIGITS) for level in levels)
+
+
+def pack_class_list(records: Sequence[tuple[int, int, int]]) -> str:
+    """A class trainer's list (brief CT1): each record the spell, the level asked and the price in
+    copper, as TC_SPELL_DIGITS, TC_LEVEL_DIGITS and TC_COST_DIGITS base 91 digits, in the order
+    given."""
+    return "".join(
+        pack_int(spell, TC_SPELL_DIGITS) + pack_int(level, TC_LEVEL_DIGITS) + pack_int(price, TC_COST_DIGITS)
+        for spell, level, price in records
+    )
 
 
 # ----- packed rows (brief OPT7) ----------------------------------------------------------------
@@ -904,6 +939,9 @@ class CreatureFacts:
     # the kind of trainer the row is (TRAINER_TYPE_CLASS, TRAINER_TYPE_MOUNTS, TRAINER_TYPE_TRADESKILLS,
     # TRAINER_TYPE_PETS). A plain number, read so a class or pet trainer joins the table as a name.
     trainer_type: int = 0
+    # Brief CT1: `TrainerClass`, the class a class trainer teaches (a ChrClasses id, CLASS_IDS), 0
+    # for every other creature. A plain number, read so `tc` can say which class a list is for.
+    trainer_class: int = 0
 
 
 @dataclass(frozen=True)
@@ -1070,6 +1108,12 @@ class EraInput:
     # rows state. Read only where the dump states the column.
     trainer_ranks: dict[tuple[int, int], int] = field(default_factory=dict)
     trainer_template_ranks: dict[tuple[int, int], int] = field(default_factory=dict)
+    # Brief CT1 (the owner, 2026-10-17): the same two tables' reqlevel and spellcost, the level a
+    # class trainer asks before teaching the spell and its price in copper, (entry, spell as the row
+    # names it) -> (level, price), the lowest of each the rows state. Read only where the dump
+    # states both columns; only a class trainer's rows are ever shipped (`tc`).
+    trainer_terms: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
+    trainer_template_terms: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
     # Brief Q1: `game_event_quest`, questId -> the game events it belongs to, ascending (ids only;
     # quest_events reads it), and the reputation turn ins (quest_turn_ins).
     quest_event_links: dict[int, tuple[int, ...]] = field(default_factory=dict)
@@ -1133,6 +1177,8 @@ CMANGOS_FIELDS = frozenset(
         "learned_spells",
         "trainer_ranks",
         "trainer_template_ranks",
+        "trainer_terms",
+        "trainer_template_terms",
         "quest_event_links",
         "quest_turn_ins",
         "quest_levels",
@@ -1261,6 +1307,12 @@ class EraSources:
     # Brief TR5: the same NAME's index -> the learn level of each of those spells, packed by
     # pack_levels in the same order. Shipped as `tv`.
     trainer_levels: dict[int, str] = field(default_factory=dict)
+    # Brief CT1: the class trainers' lists, shipped as `tc`: each distinct list packed by
+    # pack_class_list (`l`), the class each is for (`c`, parallel to it) and a class trainer NAME's
+    # index into `s` -> the 1 based number of its list (`n`).
+    class_lists: list[str] = field(default_factory=list)
+    class_list_classes: list[int] = field(default_factory=list)
+    class_trainer_lists: dict[int, int] = field(default_factory=dict)
     # Brief W12: questId -> the items it asks the player to bring with their counts, packed by
     # pack_requires, for every kept quest that asks for an item this build ships.
     quest_requires: dict[int, str] = field(default_factory=dict)
@@ -1293,6 +1345,15 @@ class EraSources:
             out.pop()
         return out
 
+    def class_value(self) -> dict:
+        """Brief CT1: `tc` as it ships, { l = { packed list, ... }, c = { class id, ... }, n = {
+        [string index] = list number } }."""
+        return {
+            "l": list(self.class_lists),
+            "c": list(self.class_list_classes),
+            "n": dict(self.class_trainer_lists),
+        }
+
     def gpl_value(self, generated: str | None = None) -> dict:
         """EraSources.lua's value (brief GA1): the GPL_FIELDS tables and `s` with every blank place
         empty (gpl_strings). `generated` is the compile's stamp, the same one the header prints, and
@@ -1317,6 +1378,8 @@ class EraSources:
         }
         if self.trainer_levels:
             value["tv"] = dict(self.trainer_levels)
+        if self.class_trainer_lists:
+            value["tc"] = self.class_value()
         if self.quest_chains:
             value["qc"] = {quest: {"c": c, "cl": cl} for quest, (c, cl) in self.quest_chains.items()}
         if self.quest_events:
@@ -1333,9 +1396,11 @@ class EraSources:
 
 # Brief GA1: the keys EraSources.lua (GPL-3.0) may hold, and nothing else. Each is read out of the
 # pinned CMaNGOS dump (or pfQuest's area ids inside `r` and `xl`), selected, ordered and packed.
+# Brief CT1 adds `tc`, the class trainers' lists (npc_trainer and npc_trainer_template, as `tr` and
+# `tv` are): a key the owner's word puts here (docs/licensing.md).
 GPL_FIELDS = frozenset(
     {
-        *("s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "st", "tr", "tv", "qr"),
+        *("s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "st", "tr", "tv", "tc", "qr"),
         *("qc", "qe", "ql", "qa", "x", "xl", "g"),
     }
 )
@@ -1784,11 +1849,13 @@ def _absorb(
             faction=_int(col("Faction") if col("Faction") is not None else col("FactionAlliance")),
             trainer_template=_int(col("TrainerTemplateId")),
             trainer_type=_int(col("TrainerType")),
+            trainer_class=_int(col("TrainerClass")),
         )
         return
     if table in ("npc_trainer", "npc_trainer_template"):
         # Brief P6a: the entry and the spell; brief TR5 (the owner's ruling of 2026-10-13) the
-        # required skill rank beside them. Not the cost, the required skill line, level or
+        # required skill rank beside them; brief CT1 (the owner, 2026-10-17) the required level and
+        # the price, which only a class trainer's list ships (`tc`). Not the required skill line or
         # abilities, not the condition.
         pair = (_int(col("entry")), _int(col("spell")))
         (era.trainer_spells if table == "npc_trainer" else era.trainer_template_spells).append(pair)
@@ -1796,6 +1863,11 @@ def _absorb(
             ranks = era.trainer_ranks if table == "npc_trainer" else era.trainer_template_ranks
             rank = max(0, _int(col("reqskillvalue")))
             ranks[pair] = min(rank, ranks.get(pair, rank))
+        if "reqlevel" in index and "spellcost" in index:
+            terms = era.trainer_terms if table == "npc_trainer" else era.trainer_template_terms
+            level, price = max(0, _int(col("reqlevel"))), max(0, _int(col("spellcost")))
+            held = terms.get(pair)
+            terms[pair] = (level, price) if held is None else (min(held[0], level), min(held[1], price))
         return
     if table == "spell_template":
         # Brief P6a: the id and the three effects with their trigger spells, and only for a spell
@@ -3440,6 +3512,96 @@ def class_trainers(
     return names, ids
 
 
+def trainer_creature_terms(era_input: CmangosFacts) -> dict[int, dict[int, tuple[int, int]]]:
+    """Brief CT1: creature id -> taught spell id -> (level, price), the level the trainer asks and
+    the price in copper.
+
+    The same join as trainer_creature_spells (its own rows and its template's, a learn spell read as
+    the spell it teaches), over npc_trainer's reqlevel and spellcost and npc_trainer_template's: the
+    lowest of each where two rows name one spell. A row the dump states neither column for is left
+    out (its spell reads 0 and 0 in the list)."""
+    learned = era_input.learned_spells
+
+    def lowest(into: dict[int, tuple[int, int]], spell: int, terms: tuple[int, int]) -> None:
+        if spell <= 0:
+            return
+        held = into.get(spell)
+        into[spell] = terms if held is None else (min(held[0], terms[0]), min(held[1], terms[1]))
+
+    templates: dict[int, dict[int, tuple[int, int]]] = defaultdict(dict)
+    for (template, spell), terms in era_input.trainer_template_terms.items():
+        lowest(templates[template], learned.get(spell, spell), terms)
+    out: dict[int, dict[int, tuple[int, int]]] = defaultdict(dict)
+    for (creature, spell), terms in era_input.trainer_terms.items():
+        lowest(out[creature], learned.get(spell, spell), terms)
+    for creature_id, facts in era_input.creatures.items():
+        if not facts.trainer_template:
+            continue
+        for taught, terms in templates.get(facts.trainer_template, {}).items():
+            lowest(out[creature_id], taught, terms)
+    return {creature: terms for creature, terms in sorted(out.items()) if creature > 0}
+
+
+def _class_trainer_lists(
+    era_input: CmangosFacts, names: Collection[str], counts: dict[str, int], dropped: dict[str, int]
+) -> tuple[dict[str, int], list[str], list[int]]:
+    """Brief CT1 (the owner, 2026-10-17): a class trainer NAME -> the 1 based number of its list,
+    the lists themselves (packed by pack_class_list, each distinct list once) and the class each
+    list is for.
+
+    The names are class_trainers' (named, spawned); a creature of one speaks for it only where its
+    TrainerType is a class trainer's and its TrainerClass a playable class (CLASS_IDS), so a pet
+    trainer ships no list, and a class trainer of no class is counted under
+    `classTrainerNoClass`. Keyed by the NAME, the way `tr` is: the name teaches the union of its
+    creatures' spells, each at the lowest level and the lowest price any of them asks, in level
+    order then spell id. Where its creatures name two classes the lowest class id is the list's
+    (`classTrainerClassesDisagree`; none do in the pinned dump). A CMaNGOS rule alone: nothing of
+    the caller's chooses a record, so a spell a client build no longer has ships as the dump states
+    it, and the addon leaves out what its client cannot name (EraPlaces.lua's `tf`, the caller's)."""
+    terms = trainer_creature_terms(era_input)
+    taught: dict[str, dict[int, tuple[int, int]]] = defaultdict(dict)
+    classes: dict[str, set[int]] = defaultdict(set)
+    for creature, spells in trainer_creature_spells(era_input).items():
+        facts = era_input.creatures.get(creature)
+        if facts is None or facts.name not in names or facts.trainer_type != TRAINER_TYPE_CLASS or not spells:
+            continue
+        if facts.trainer_class not in CLASS_IDS:
+            dropped["classTrainerNoClass"] += 1
+            continue
+        classes[facts.name].add(facts.trainer_class)
+        held = taught[facts.name]
+        stated = terms.get(creature, {})
+        for spell in spells:
+            level, price = stated.get(spell, (0, 0))
+            known = held.get(spell)
+            held[spell] = (level, price) if known is None else (min(known[0], level), min(known[1], price))
+    pool: dict[tuple[int, str], int] = {}
+    lists: list[str] = []
+    list_classes: list[int] = []
+    numbers: dict[str, int] = {}
+    pairs = 0
+    for name in sorted(taught):
+        if len(classes[name]) > 1:
+            counts["classTrainerClassesDisagree"] = counts.get("classTrainerClassesDisagree", 0) + 1
+        class_id = min(classes[name])
+        records = sorted((level, spell, price) for spell, (level, price) in taught[name].items())
+        packed = pack_class_list([(spell, level, price) for level, spell, price in records])
+        number = pool.get((class_id, packed))
+        if number is None:
+            lists.append(packed)
+            list_classes.append(class_id)
+            number = len(lists)
+            pool[(class_id, packed)] = number
+        numbers[name] = number
+        pairs += len(records)
+    counts["classTrainerListNames"] = len(numbers)
+    counts["classTrainerLists"] = len(lists)
+    counts["classTrainerListRecords"] = sum(len(packed) // TC_RECORD_DIGITS for packed in lists)
+    counts["classTrainerListPairs"] = pairs
+    counts["classTrainerListSpells"] = len({spell for held in taught.values() for spell in held})
+    return numbers, lists, list_classes
+
+
 def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     """Turn the two pinned databases into EraSources.lua's table, counting every refusal.
 
@@ -3485,6 +3647,7 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         "trainerNothingKnown": 0,
         "classTrainerUnnamed": 0,
         "classTrainerNotSpawned": 0,
+        "classTrainerNoClass": 0,
         "questRequiresNotShipped": 0,
         "questRequiresScaffolding": 0,
     }
@@ -3590,6 +3753,11 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     class_trainer_names, class_teachers = class_trainers(era_input, counts, dropped)
     teachers = teachers | class_teachers
     counts["classTrainerNamesNew"] = len(class_trainer_names - trainer_names)
+    # Brief CT1 (the owner, 2026-10-17): and the class spells each of those names teaches, by level,
+    # with its price, one list per distinct list (`tc`).
+    class_list_of, class_lists, class_list_classes = _class_trainer_lists(
+        era_input, class_trainer_names, counts, dropped
+    )
     # Brief W15 (2026-09-29): every creature that starts or ends a titled quest ships as a name
     # of its own, with its kind, portrait, title and quest lists, even where it drops, sells and
     # trains nothing. Its kind stays a plain kind: `qg` is what says it gives quests.
@@ -3727,6 +3895,7 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         remap[index]: (pack_quests(starts), pack_quests(ends)) for index, (starts, ends) in givers.items()
     }
     index_of = {name: remap[strings.find(name)] for name in npc_names | set(object_names)}
+    class_trainer_lists = {index_of[name]: number for name, number in class_list_of.items()}
     page_names = {
         "creature": frozenset(index_of[name] for name in creature_names),
         "vendor": frozenset(index_of[name] for name in vendor_names),
@@ -3792,6 +3961,9 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         subnames=dict(sorted(subnames.items())),
         trainers=dict(sorted(trainers_out.items())),
         trainer_levels=dict(sorted(levels_out.items())),
+        class_lists=class_lists,
+        class_list_classes=class_list_classes,
+        class_trainer_lists=dict(sorted(class_trainer_lists.items())),
         quest_requires={quest: pack_requires(pairs) for quest, pairs in sorted(requires.items())},
         quest_chains=chains.numbers,
         quest_events=events,
@@ -4066,7 +4238,7 @@ def header_lines(table: EraSources) -> list[str]:
         "Historical Classic Era sources. Facts only, linked by item id. The addon joins this file to "
         "EraPlaces.lua (ours, all rights reserved), which holds the zone names and every map, pin "
         "and side, and which creature pages are one page with Forever's: z, zm, zf, cf, mp, op, ok, pt, "
-        "mc and cm.",
+        "mc and cm, and this build's own word on the class spells tc lists, tf.",
         "{ s = {strings}, r = { [itemId] = packed rows }, "
         "qt = { [questId] = string index or title }, ck = { [string index] = packed creature kind }, "
         "cd = { [string index] = creature display id }, ci = { [string index] = creature id }, "
@@ -4074,6 +4246,12 @@ def header_lines(table: EraSources) -> list[str]:
         "qg = { [string index] = { starts, ends } }, st = { [string index] = string index }, "
         "tr = { [string index] = packed spell ids }, "
         + ("tv = { [string index] = packed learn levels }, " if table.trainer_levels else "")
+        + (
+            "tc = { l = { packed class list, ... }, c = { class id, ... }, n = { [string index] = list "
+            "number } }, "
+            if table.class_trainer_lists
+            else ""
+        )
         + "qr = { [questId] = packed required items }, "
         "x = { [itemId] = { [c] = list number } }, xl = { packed list, ... }, "
         + ("qc = { [questId] = { c = position, cl = chain length } }, " if table.quest_chains else "")
@@ -4187,6 +4365,21 @@ def header_lines(table: EraSources) -> list[str]:
             if table.trainer_levels
             else ""
         )
+        + (
+            "tc: the class spells a class trainer NAME teaches (npc_trainer and npc_trainer_template "
+            "as tr reads them, for a creature whose TrainerType is a class trainer's and whose "
+            "TrainerClass is a playable class): l holds each distinct list once, a run of fixed "
+            f"{TC_RECORD_DIGITS} byte records in the x lists' base 91 alphabet, most significant digit "
+            f"first: the spell id ({TC_SPELL_DIGITS} digits), the level the trainer asks "
+            f"(npc_trainer.reqlevel, {TC_LEVEL_DIGITS} digit) and the price in copper "
+            f"(npc_trainer.spellcost, {TC_COST_DIGITS} digits), in level order then spell id, each the "
+            "lowest any creature of the name asks; c[i] is the class list i is for (creature_template."
+            "TrainerClass: 1 Warrior, 2 Paladin, 3 Hunter, 4 Rogue, 5 Priest, 7 Shaman, 8 Mage, 9 "
+            "Warlock, 11 Druid); n is keyed the way ck is, a class trainer name's 1 based number into "
+            "l. Every spell the dump states, the ones a client build no longer has included. "
+            if table.class_trainer_lists
+            else ""
+        )
         + "qr: what a quest asks the player to bring (quest_template.ReqItemId1..4 and "
         "ReqItemCount1..4), keyed by quest id: one packed string, a run of fixed "
         f"{QR_ITEM_DIGITS + QR_COUNT_DIGITS} byte records in the x lists' base 91 alphabet, most "
@@ -4272,7 +4465,16 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('trainerSpells', 0)} spells, profession and secondary only; "
         f"{counts.get('classTrainerNames', 0)} class trainers and {counts.get('petTrainerNames', 0)} "
         f"pet trainers listed for their place ({counts.get('classTrainerCreatures', 0)} creatures); "
-        f"{counts.get('questRequiresQuests', 0)} quests in qr asking for "
+        + (
+            f"{counts.get('classTrainerListNames', 0)} class trainers in tc teaching "
+            f"{counts.get('classTrainerListPairs', 0)} name and spell pairs over "
+            f"{counts.get('classTrainerListSpells', 0)} class spells, stored as "
+            f"{counts.get('classTrainerLists', 0)} distinct lists of "
+            f"{counts.get('classTrainerListRecords', 0)} records; "
+            if table.class_trainer_lists
+            else ""
+        )
+        + f"{counts.get('questRequiresQuests', 0)} quests in qr asking for "
         f"{counts.get('questRequiresItems', 0)} items ({counts.get('questRequiresPairs', 0)} quest "
         f"and item pairs; {counts.get('questRequiresTitlesByIndex', 0)} titled in qt by index, "
         f"{counts.get('questRequiresTitlesByString', 0)} by string).",
