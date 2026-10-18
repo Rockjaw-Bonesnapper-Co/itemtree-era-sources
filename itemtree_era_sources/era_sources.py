@@ -1131,6 +1131,10 @@ class EraInput:
     # hands over or asks for an item; a quest players recorded in Forever keeps its race mask's side
     # whatever it hands over. A plain number per quest; no GPL file ships it.
     quest_races: dict[int, int] = field(default_factory=dict)
+    # Addon brief QV1 (the owner's ruling "2.a" of 2026-10-18): quest_template's RewRepFaction1..5,
+    # questId -> the faction ids whose RewRepValue is above 0, in slot order, for every entry stating
+    # one. Ids only; no GPL file ships it (the caller's own table names and selects them).
+    quest_reputations: dict[int, tuple[int, ...]] = field(default_factory=dict)
 
 
 # ----- the CMaNGOS only input (brief GA1) ------------------------------------------------------
@@ -1184,6 +1188,7 @@ CMANGOS_FIELDS = frozenset(
         "quest_levels",
         "quest_classes",
         "quest_races",
+        "quest_reputations",
     }
 )
 # Read out of the two pinned pfQuest files, which give the area id a spawn is in and nothing else.
@@ -2000,6 +2005,14 @@ def _absorb(
         races = _int(col("RequiredRaces"))
         if qid > 0 and races > 0:
             era.quest_races[qid] = races
+        # Addon brief QV1: the factions the quest raises, ids only, in slot order.
+        reputations = tuple(
+            _int(col(f"RewRepFaction{number}"))
+            for number in range(1, 6)
+            if _int(col(f"RewRepFaction{number}")) > 0 and _int(col(f"RewRepValue{number}")) > 0
+        )
+        if qid > 0 and reputations:
+            era.quest_reputations[qid] = tuple(dict.fromkeys(reputations))
         requires: list[int] = []
         require_counts: list[int] = []
         for number in range(1, 5):
