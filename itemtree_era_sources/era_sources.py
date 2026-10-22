@@ -23,7 +23,8 @@ summarised group, a limited stock vendor's stock count, the container item's own
 2026-09-20 a handful of **map pins** per creature name per area, and since 2026-09-27 per herb,
 vein, fishing pool and chest name per area too, and since brief N3 which creature starts and which
 ends each quest, by the creature's name, and since brief EK1 the lowest creature and object entry
-id of each name (`ci`, `oi`), which the addon keys a page by. No prose of any kind: not the
+id of each name (`ci`, `oi`), which the addon keys a page by, and since brief EO1 which world object
+starts and which ends each quest, by the object's name (`og`). No prose of any kind: not the
 loot rows' `comments`, not quest text, not gossip, not scripts.
 
 Since 2026-09-27 (brief T1, on the owner's ruling of 2026-09-27) two more columns of
@@ -55,10 +56,35 @@ quest ships as a name of its own, even where it drops, sells and trains nothing:
 `s`, its kind in `ck`, its display id in `cd`, its `SubName` in `st` and its quest lists in `qg`
 (its pins and side in the caller's EraPlaces.lua), read by exactly the rules those columns follow.
 Brief N3 had shipped a giver only where another row already named it. Nothing new is read, and a
-creature with no quest link is untouched. Gameobject givers are not read (the objects this
-module reads are loot sources only). So that a list record's two digit name field still fits
+creature with no quest link is untouched. So that a list record's two digit name field still fits
 once `s` passes 8,280 strings, such an `s` is two sorted runs: the names the lists carry, then
 the rest. A table that fits stays one sorted run.
+
+Since 2026-10-22 (brief IW1, on the owner's ruling "B" of 2026-10-22: "Do B") the repeatable quests
+that can only be taken while another quest is in the log ship their parent: `quest_template.PrevQuestId`
+below 0 on a repeatable quest (SpecialFlags' repeatable bit, the columns QN1 and Q1 already read), as
+`qw = { [questId] = parent questId }`, ids only. Filling the Soul Gem (593, PrevQuestId -592) is
+available only while Saving Yenniku (592) is in the log, so the addon counts it as part of 592 rather
+than as a repeatable quest of its own. Only repeatable ones ship: a one time quest with a negative
+PrevQuestId keeps the item by the ordinary quest rules, so its parent would be read by nothing.
+
+Since 2026-10-22 (brief PL1, on the owner's ruling "B" of 2026-10-22: ship the Classic Era quests'
+prerequisite links) the same three chain link columns ship as links too, not only as `qc`'s numbers:
+for every quest, the quests that come after it, as `qo`, keyed by quest id, each value the later
+quests' ids packed as a `qg` list is. A later quest is one whose `PrevQuestId` is the quest, or the
+quest's own `NextQuestId` or `NextQuestInChain`, each above 0 (quest_chains' own rule for a step), ids
+only and nothing else read. So a step whose next quest has another title still has a next step:
+Legends of Maraudon (7044) leads on to The Scepter of Celebras (7046, PrevQuestId 7044), which `qc`
+cannot say.
+
+Since 2026-10-22 (brief EO1, on the owner's ruling "3A" of 2026-10-22) the world OBJECTS that start
+and end quests are read the same way: `gameobject_questrelation` (which object starts a quest) and
+`gameobject_involvedrelation` (which ends one), two id columns each and nothing else, so a wanted
+poster's quest names its poster. Every object those two tables name for a titled quest ships as an
+object name of its own: its name in `s`, its id in `oi` and its quest lists in `og`, keyed by the
+object's name and packed exactly as `qg` is (its pins in the caller's EraPlaces.lua `op`, from the
+`gameobject` positions of those objects, read as a chest's are). Its own key rather than `qg`,
+because one string can name a creature and an object both. No quest text, no gossip, no script.
 
 Since brief P6a three more tables are read, for the trainers: `npc_trainer` (a creature id and a
 spell id per row), `npc_trainer_template` (a template id and a spell id per row, joined to a
@@ -1078,7 +1104,8 @@ class EraInput:
     object_spawn_maps: dict[int, tuple[int, ...]] = field(default_factory=dict)
     # The object map pins' three inputs (brief D7), the twins of `spawns`, `spawn_entries` and
     # `unit_points`. `object_spawns` is the cmangos `gameobject` table, kept only for a chest or a
-    # fishing hole with a loot template (see lootable_object_spawns), each a Spawn whose
+    # fishing hole with a loot template and (brief EO1) an object that starts or ends a quest (see
+    # lootable_object_spawns), each a Spawn whose
     # `creature` field holds the object id; `object_spawn_entries` is `gameobject_spawn_entry`
     # for the guids among them that leave `id` at 0; `object_points` is pfQuest per object spawn,
     # for the area id and for the cross check.
@@ -1092,6 +1119,11 @@ class EraInput:
     quest_starts: list[tuple[int, int]] = field(default_factory=list)
     quest_ends: list[tuple[int, int]] = field(default_factory=list)
     quest_names: dict[int, str] = field(default_factory=dict)
+    # Brief EO1 (the owner's ruling "3A" of 2026-10-22): `gameobject_questrelation` (which world
+    # object starts a quest) and `gameobject_involvedrelation` (which ends one), each as (object id,
+    # quest id) in the dump's order. Two id columns and nothing else.
+    object_quest_starts: list[tuple[int, int]] = field(default_factory=list)
+    object_quest_ends: list[tuple[int, int]] = field(default_factory=list)
     # Brief QN1 (the owner's ruling of 2026-10-03): quest_template's three chain link columns,
     # questId -> (PrevQuestId, NextQuestId, NextQuestInChain), for every entry with one non zero.
     # Ids only. Read to number the quests of one chain that share a title (quest_chains).
@@ -1175,6 +1207,8 @@ CMANGOS_FIELDS = frozenset(
         "quest_starts",
         "quest_ends",
         "quest_names",
+        "object_quest_starts",
+        "object_quest_ends",
         "quest_links",
         "trainer_spells",
         "trainer_template_spells",
@@ -1305,6 +1339,9 @@ class EraSources:
     # Brief N3: a creature or vendor name's index into `s` -> (the quests it starts, the quests it
     # ends), each a string packed by pack_quests, "" where it has none of that side.
     quest_givers: dict[int, tuple[str, str]] = field(default_factory=dict)
+    # Brief EO1: a world OBJECT name's index into `s` -> (the quests it starts, the quests it ends),
+    # packed as quest_givers is. Shipped as `og`.
+    object_givers: dict[int, tuple[str, str]] = field(default_factory=dict)
     # Brief T1: a vendor or quest giver NAME's index into `s` -> its SubName's index into `s`.
     subnames: dict[int, int] = field(default_factory=dict)
     # Brief P6a: a trainer NAME's index into `s` -> the spell ids it teaches, packed by pack_spells.
@@ -1331,13 +1368,20 @@ class EraSources:
     # Brief INT1b (the owner's ruling of 2026-10-10): questId -> the class mask of a class restricted
     # quest (quest_class_mask). Shipped as `qa`, beside an item row's `ac` (its allowed classes).
     quest_classes: dict[int, int] = field(default_factory=dict)
+    # Brief IW1 (the owner's ruling "B" of 2026-10-22): a repeatable quest that can only be taken while
+    # another is in the log (PrevQuestId < 0) -> that parent quest (quest_helpers). Shipped as `qw`.
+    quest_helpers: dict[int, int] = field(default_factory=dict)
+    # Brief PL1 (the owner's ruling "B" of 2026-10-22): questId -> the quests that come after it (its
+    # chain links, quest_successors), packed by pack_quests. Shipped as `qo`.
+    quest_next: dict[int, str] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
     # Brief EK1, for the caller that places the names (never shipped): which names the table opens
     # a page for, by their index into `s` and by the rule that ships each ("creature": a c = 1, 6,
-    # 7 or 12 row or list names it; "vendor": a c = 4 row or list; "trainer": `tr`; "giver": `qg`),
-    # every object name a row or list names with the category it is filed under (the lower where
-    # two), and the creature ids whose lists `tr` holds.
+    # 7 or 12 row or list names it; "vendor": a c = 4 row or list; "trainer": `tr`; "giver": `qg`;
+    # brief EO1 "objectGiver": the OBJECT names `og` carries), every object name a row or list names
+    # with the category it is filed under (the lower where two), and the creature ids whose lists
+    # `tr` holds.
     page_names: dict[str, frozenset[int]] = field(default_factory=dict)
     object_names: dict[int, int] = field(default_factory=dict)
     teachers: frozenset[int] = frozenset()
@@ -1385,6 +1429,9 @@ class EraSources:
             value["tv"] = dict(self.trainer_levels)
         if self.class_trainer_lists:
             value["tc"] = self.class_value()
+        # Brief EO1: the quests a world object starts and ends, absent where no object gives one.
+        if self.object_givers:
+            value["og"] = {index: list(pair) for index, pair in self.object_givers.items()}
         if self.quest_chains:
             value["qc"] = {quest: {"c": c, "cl": cl} for quest, (c, cl) in self.quest_chains.items()}
         if self.quest_events:
@@ -1393,6 +1440,12 @@ class EraSources:
             value["ql"] = dict(self.quest_levels)
         if self.quest_classes:
             value["qa"] = dict(self.quest_classes)
+        # Brief IW1: the repeatable helpers' parents, absent where none ships.
+        if self.quest_helpers:
+            value["qw"] = dict(self.quest_helpers)
+        # Brief PL1: the quests that come after each quest, absent where none ships.
+        if self.quest_next:
+            value["qo"] = dict(self.quest_next)
         if generated:
             value["g"] = generated
         check_gpl_value(value, self.blank)
@@ -1402,11 +1455,16 @@ class EraSources:
 # Brief GA1: the keys EraSources.lua (GPL-3.0) may hold, and nothing else. Each is read out of the
 # pinned CMaNGOS dump (or pfQuest's area ids inside `r` and `xl`), selected, ordered and packed.
 # Brief CT1 adds `tc`, the class trainers' lists (npc_trainer and npc_trainer_template, as `tr` and
-# `tv` are): a key the owner's word puts here (docs/licensing.md).
+# `tv` are): a key the owner's word puts here (docs/licensing.md). Brief EO1 adds `og`, the quests a
+# world object starts and ends (gameobject_questrelation and gameobject_involvedrelation, as `qg`
+# reads the creature ones), on the owner's ruling "3A" of 2026-10-22. Brief IW1 adds `qw`, a repeatable
+# helper quest's parent (quest_template.PrevQuestId below 0), on the owner's ruling "B" of 2026-10-22.
+# Brief PL1 adds `qo`, the quests that come after a quest (quest_template.PrevQuestId, NextQuestId and
+# NextQuestInChain above 0), on the owner's ruling "B" of 2026-10-22 (the prerequisite links).
 GPL_FIELDS = frozenset(
     {
-        *("s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "st", "tr", "tv", "tc", "qr"),
-        *("qc", "qe", "ql", "qa", "x", "xl", "g"),
+        *("s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "og", "st", "tr", "tv", "tc", "qr"),
+        *("qc", "qe", "ql", "qa", "qw", "qo", "x", "xl", "g"),
     }
 )
 # The keys a packed module adds beside them (pack_module).
@@ -1551,6 +1609,10 @@ WANTED_TABLES = (
     # id and a quest id, and nothing else in either table.
     "creature_questrelation",
     "creature_involvedrelation",
+    # Brief EO1 (the owner's ruling "3A" of 2026-10-22): which world object starts a quest and which
+    # one ends it. Two columns each, an object id and a quest id, and nothing else in either table.
+    "gameobject_questrelation",
+    "gameobject_involvedrelation",
     # Brief P6a: which creature teaches which spell, directly or through a trainer template, and
     # spell_template's learn effects to turn a trainer's learn spell into the spell it teaches.
     "npc_trainer",
@@ -1742,7 +1804,7 @@ def read_cmangos(path: Path) -> EraInput:
     }
     era.object_spawn_maps = object_maps(reading.object_rows, reading.object_entries)
     era.object_spawns, era.object_spawn_entries = lootable_object_spawns(
-        reading.object_rows, reading.object_entries, era.objects
+        reading.object_rows, reading.object_entries, era.objects, quest_objects(era)
     )
     return era
 
@@ -1769,27 +1831,43 @@ def _lootable(obj: ObjectFacts | None) -> bool:
     return obj is not None and obj.kind in (GO_TYPE_CHEST, GO_TYPE_FISHING_HOLE) and bool(obj.loot)
 
 
+def quest_objects(era_input: CmangosFacts) -> frozenset[int]:
+    """Brief EO1: every object id gameobject_questrelation or gameobject_involvedrelation names, the
+    objects that start or end a quest."""
+    return frozenset(
+        int(oid)
+        for relation in (era_input.object_quest_starts, era_input.object_quest_ends)
+        for oid, _q in relation
+    )
+
+
 def lootable_object_spawns(
     rows: Sequence[tuple[int, int, int, float, float]],
     entries: Mapping[int, Sequence[int]],
     objects: Mapping[int, ObjectFacts],
+    quest_givers: Collection[int] = frozenset(),
 ) -> tuple[tuple[Spawn, ...], dict[int, tuple[int, ...]]]:
     """The `gameobject` rows an object pin could ever be made from, as spawns, and the spawn
     entries of the guids among them that leave their id at 0.
 
-    Only a chest or a fishing hole with a loot template can be the object a source row names, so
-    every other object's spawn (a door, a chair, a mailbox, a quest object) is dropped here, at
-    the end of the streaming pass, and never reaches an EraInput. A Spawn's `creature` field
-    holds the OBJECT id: the shape is the creature table's, and so is every rule read over it.
+    Only a chest or a fishing hole with a loot template can be the object a source row names, and
+    (brief EO1) only an object `quest_givers` names (quest_objects) can be a quest's giver or turn
+    in, so every other object's spawn (a door, a chair, a mailbox) is dropped here, at the end of
+    the streaming pass, and never reaches an EraInput. A Spawn's `creature` field holds the OBJECT
+    id: the shape is the creature table's, and so is every rule read over it.
     """
+
+    def kept(oid: int) -> bool:
+        return _lootable(objects.get(oid)) or oid in quest_givers
+
     kept_entries: dict[int, tuple[int, ...]] = {}
     spawns: list[Spawn] = []
     for guid, oid, map_id, x, y in sorted(rows):
         if oid:
-            if not _lootable(objects.get(oid)):
+            if not kept(oid):
                 continue
         else:
-            members = tuple(sorted({e for e in entries.get(guid, ()) if _lootable(objects.get(e))}))
+            members = tuple(sorted({e for e in entries.get(guid, ()) if kept(e)}))
             if not members:
                 continue
             kept_entries[guid] = members
@@ -1960,6 +2038,13 @@ def _absorb(
     if table in ("creature_questrelation", "creature_involvedrelation"):
         pair = (_int(col("id")), _int(col("quest")))
         (era.quest_starts if table == "creature_questrelation" else era.quest_ends).append(pair)
+        return
+    if table in ("gameobject_questrelation", "gameobject_involvedrelation"):
+        # Brief EO1: the object and the quest, two ids, the creature tables' twins.
+        pair = (_int(col("id")), _int(col("quest")))
+        (era.object_quest_starts if table == "gameobject_questrelation" else era.object_quest_ends).append(
+            pair
+        )
         return
     if table == "game_event_quest":
         # Brief Q1: a quest and a game event it belongs to, two ids.
@@ -3261,6 +3346,49 @@ def _quest_givers(
     return out
 
 
+def _object_givers(
+    era_input: CmangosFacts,
+    strings: _Strings,
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> dict[int, tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Brief EO1 (the owner's ruling "3A" of 2026-10-22): a world OBJECT name's index into `s` ->
+    (the quests it starts, the quests it ends), out of gameobject_questrelation and
+    gameobject_involvedrelation, by exactly _quest_givers' rules: keyed by the NAME (every object of
+    one name is the same giver to a player: the four "Wanted Poster" entries are one poster), a
+    relation row whose object has no template or a scaffolding name gives nothing
+    (`objectGiverNotShipped`), and a quest with no title or a scaffolding one is no reason to ship
+    a name (`objectGiverUntitled`, `objectGiverScaffolding`). Every object those rules keep ships as
+    a name of its own, whatever else it is: a wanted poster drops nothing and is no chest. Each list
+    is quest id ascending with repeats dropped; a quest a name both starts and ends is in both."""
+    lists: dict[str, tuple[set[int], set[int]]] = {}
+    for side, relation in ((0, era_input.object_quest_starts), (1, era_input.object_quest_ends)):
+        for object_id, quest in relation:
+            facts = era_input.objects.get(object_id)
+            if facts is None or not facts.name or is_scaffolding(facts.name):
+                dropped["objectGiverNotShipped"] += 1
+                continue
+            title = era_input.quest_names.get(quest, "")
+            if not title:
+                dropped["objectGiverUntitled"] += 1
+                continue
+            if is_scaffolding(title):
+                dropped["objectGiverScaffolding"] += 1
+                continue
+            lists.setdefault(facts.name, (set(), set()))[side].add(quest)
+    out: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    for name in sorted(lists):
+        starts, ends = lists[name]
+        out[strings.add(name)] = (tuple(sorted(starts)), tuple(sorted(ends)))
+    counts["objectGiverNames"] = len(out)
+    counts["objectGiverStarts"] = sum(len(pair[0]) for pair in out.values())
+    counts["objectGiverEnds"] = sum(len(pair[1]) for pair in out.values())
+    counts["objectGiverQuests"] = len({quest for pair in out.values() for side in pair for quest in side})
+    counts["objectRelationStartRows"] = len(era_input.object_quest_starts)
+    counts["objectRelationEndRows"] = len(era_input.object_quest_ends)
+    return out
+
+
 def _quest_requires(
     era_input: CmangosFacts,
     shipped: Callable[[int], bool],
@@ -3654,6 +3782,9 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         "questGiverNotShipped": 0,
         "questGiverUntitled": 0,
         "questGiverScaffolding": 0,
+        "objectGiverNotShipped": 0,
+        "objectGiverUntitled": 0,
+        "objectGiverScaffolding": 0,
         "trainerUnnamed": 0,
         "trainerSpellUnknown": 0,
         "trainerSpellClass": 0,
@@ -3795,6 +3926,16 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
                 quest_titles[quest] = strings.add(era_input.quest_names[quest])
                 added += 1
     counts["questGiverTitlesAdded"] = added
+    # Brief EO1: the world objects that start and end quests, by name, titled by the same rule.
+    object_givers = _object_givers(era_input, strings, counts, dropped)
+    added = 0
+    for starts, ends in object_givers.values():
+        for quest in (*starts, *ends):
+            if quest not in handed_over and quest not in quest_titles:
+                quest_titles[quest] = strings.add(era_input.quest_names[quest])
+                added += 1
+    counts["objectGiverTitlesAdded"] = added
+    object_giver_names = {strings.value(index) for index in object_givers}
     # Brief W12: what each kept quest asks the player to bring, so a quest item's Used by can name
     # the quest. Titled at the end, once every other string is in.
     requires = _quest_requires(
@@ -3823,7 +3964,9 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     # caller (brief D7: the object pins are EraPlaces.lua's).
     object_names = _object_names(entries, leftovers, strings)
     # Brief EK1 Part 2c: the lowest object entry id behind each of those names, keyed the way op is.
-    object_ids = _object_ids(era_input, object_names, strings, counts)
+    # Brief EO1: and behind each object name og carries, so a quest's giver row opens its page.
+    object_ids = _object_ids(era_input, set(object_names) | object_giver_names, strings, counts)
+    counts["objectGiverNamesSharedWithRows"] = len(object_giver_names & set(object_names))
 
     # Brief W12: a qr quest no c = 3 row and no qt entry titles gets its title in qt. Where `s`
     # already holds that very string the entry is its index, as every qt entry was before; where it
@@ -3862,6 +4005,13 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     counts["questLevels"] = len(era_input.quest_levels)
     # Brief INT1b: the class restricted quests.
     counts["questClasses"] = len(era_input.quest_classes)
+    # Brief IW1 (the owner's ruling "B" of 2026-10-22): the repeatable helper quests and their parents.
+    helpers = quest_helpers(era_input)
+    counts["questHelpers"] = len(helpers)
+    # Brief PL1 (the owner's ruling "B" of 2026-10-22): the quests that come after each quest.
+    later = quest_successors(era_input.quest_links, era_input.quest_ids, era_input.quest_names)
+    counts["questNextQuests"] = len(later)
+    counts["questNextLinks"] = sum(len(quests) for quests in later.values())
 
     # Brief W15: the names a list record packs go first, so their two digit field always fits.
     listed_names = {
@@ -3907,7 +4057,13 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     givers_out = {
         remap[index]: (pack_quests(starts), pack_quests(ends)) for index, (starts, ends) in givers.items()
     }
-    index_of = {name: remap[strings.find(name)] for name in npc_names | set(object_names)}
+    object_givers_out = {
+        remap[index]: (pack_quests(starts), pack_quests(ends))
+        for index, (starts, ends) in object_givers.items()
+    }
+    index_of = {
+        name: remap[strings.find(name)] for name in npc_names | set(object_names) | object_giver_names
+    }
     class_trainer_lists = {index_of[name]: number for name, number in class_list_of.items()}
     page_names = {
         "creature": frozenset(index_of[name] for name in creature_names),
@@ -3915,6 +4071,8 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         "trainer": frozenset(index_of[name] for name in trainer_names),
         "classTrainer": frozenset(index_of[name] for name in class_trainer_names),
         "giver": frozenset(index_of[name] for name in giver_names),
+        # Brief EO1: the world objects og carries, for the caller's object pins (EraPlaces.lua op).
+        "objectGiver": frozenset(index_of[name] for name in object_giver_names),
     }
     object_names_out = {index_of[name]: category for name, category in object_names.items()}
 
@@ -3971,6 +4129,7 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         creature_ids=dict(sorted(creature_ids.items())),
         object_ids=dict(sorted(object_ids.items())),
         quest_givers=dict(sorted(givers_out.items())),
+        object_givers=dict(sorted(object_givers_out.items())),
         subnames=dict(sorted(subnames.items())),
         trainers=dict(sorted(trainers_out.items())),
         trainer_levels=dict(sorted(levels_out.items())),
@@ -3984,6 +4143,8 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
             quest: pack_quest_level(*pair) for quest, pair in sorted(era_input.quest_levels.items())
         },
         quest_classes=dict(sorted(era_input.quest_classes.items())),
+        quest_helpers=helpers,
+        quest_next={quest: pack_quests(quests) for quest, quests in later.items()},
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -4035,6 +4196,32 @@ class QuestChains:
         return agree, disagree
 
 
+def quest_successors(
+    links: Mapping[int, tuple[int, int, int]],
+    quest_ids: Collection[int] = (),
+    names: Collection[int] = (),
+) -> dict[int, tuple[int, ...]]:
+    """The quests that come after each quest, out of `quest_template`'s three chain link columns
+    (brief QN1's rule for a step, which quest_chains numbers by; since brief PL1, the owner's ruling
+    "B" of 2026-10-22, it also ships as `qo`): questId -> the later quest ids, ascending, in quest id
+    order, for every quest with one. A positive `PrevQuestId` makes the quest a later one of that
+    quest; a positive `NextQuestId` or `NextQuestInChain` names a later one of the quest itself. A
+    negative link (a quest that must be in the log at the same time) is no step, and a link to itself
+    or to an id `quest_template` does not hold is dropped. `quest_ids` is every entry (empty: every id
+    `names` or `links` holds). Ids only. Pure."""
+    known = set(quest_ids) or (set(names) | set(links))
+    succ: dict[int, set[int]] = defaultdict(set)
+    for quest, (prev, nxt, in_chain) in links.items():
+        if quest not in known:
+            continue
+        if prev > 0 and prev in known and prev != quest:
+            succ[prev].add(quest)
+        for later in (nxt, in_chain):
+            if later > 0 and later in known and later != quest:
+                succ[quest].add(later)
+    return {quest: tuple(sorted(succ[quest])) for quest in sorted(succ)}
+
+
 def quest_chains(
     names: Mapping[int, str],
     links: Mapping[int, tuple[int, int, int]],
@@ -4058,16 +4245,7 @@ def quest_chains(
     linked to none of the others is not numbered: that is the zone suffix's case, the addon's.
     Pure.
     """
-    known = set(quest_ids) or (set(names) | set(links))
-    succ: dict[int, set[int]] = defaultdict(set)
-    for quest, (prev, nxt, in_chain) in links.items():
-        if quest not in known:
-            continue
-        if prev > 0 and prev in known and prev != quest:
-            succ[prev].add(quest)
-        for later in (nxt, in_chain):
-            if later > 0 and later in known and later != quest:
-                succ[quest].add(later)
+    succ = quest_successors(links, quest_ids, names)
 
     def reach(start: int) -> set[int]:
         seen: set[int] = set()
@@ -4205,6 +4383,18 @@ def pack_quest_level(level: int, minimum: int) -> int:
     return level + QL_LEVEL_SPAN * minimum
 
 
+def quest_helpers(era_input: CmangosFacts) -> dict[int, int]:
+    """Brief IW1 (the owner's ruling "B" of 2026-10-22): questId -> its parent questId, in quest id order,
+    for every repeatable quest (quest_turn_ins, SpecialFlags' repeatable bit) whose PrevQuestId is below
+    0: CMaNGOS's mark that the quest can only be taken while the parent quest is in the log (Filling the
+    Soul Gem 593, -592: only while Saving Yenniku is). Ids only, out of the columns QN1 and Q1 read."""
+    out: dict[int, int] = {}
+    for quest, (previous, _next, _in_chain) in sorted(era_input.quest_links.items()):
+        if previous < 0 and quest in era_input.quest_turn_ins:
+            out[quest] = -previous
+    return out
+
+
 def quest_events(era_input: CmangosFacts) -> dict[int, int]:
     """questId -> the game event it belongs to, the lowest event id where it belongs to several,
     in quest id order: every quest `game_event_quest` names, and every quest whose givers the dump
@@ -4256,7 +4446,9 @@ def header_lines(table: EraSources) -> list[str]:
         "qt = { [questId] = string index or title }, ck = { [string index] = packed creature kind }, "
         "cd = { [string index] = creature display id }, ci = { [string index] = creature id }, "
         "oi = { [string index] = object id }, "
-        "qg = { [string index] = { starts, ends } }, st = { [string index] = string index }, "
+        "qg = { [string index] = { starts, ends } }, "
+        + ("og = { [string index] = { starts, ends } }, " if table.object_givers else "")
+        + "st = { [string index] = string index }, "
         "tr = { [string index] = packed spell ids }, "
         + ("tv = { [string index] = packed learn levels }, " if table.trainer_levels else "")
         + (
@@ -4271,6 +4463,8 @@ def header_lines(table: EraSources) -> list[str]:
         + ("qe = { [questId] = game event id }, " if table.quest_events else "")
         + ("ql = { [questId] = level + 128 * minimum level }, " if table.quest_levels else "")
         + ("qa = { [questId] = class mask }, " if table.quest_classes else "")
+        + ("qw = { [questId] = parent questId }, " if table.quest_helpers else "")
+        + ("qo = { [questId] = the quests that come after it, packed }, " if table.quest_next else "")
         + "legend = { {field, type}, ... }, packed = 1, g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
@@ -4347,7 +4541,8 @@ def header_lines(table: EraSources) -> list[str]:
         "creatures of one name still share one page. Present for every name ck carries that an entry "
         "states exactly.",
         "oi: the CMaNGOS object id an OBJECT name's page is keyed by (a herb, a vein, a fishing pool "
-        "or a chest: the names c=8, 9, 10 and 11 rows and their x lists use): the LOWEST "
+        "or a chest: the names c=8, 9, 10 and 11 rows and their x lists use, and since 2026-10-22 the "
+        "world objects og carries): the LOWEST "
         "gameobject_template entry whose name is exactly that string, so objects of one name share one "
         "page. Present for every such name an entry states exactly.",
         "qg: the quests a creature NAME starts and ends (creature_questrelation, "
@@ -4356,7 +4551,16 @@ def header_lines(table: EraSources) -> list[str]:
         "both started and ended there. Every quest here is titled by a c=3 row or by qt. Since "
         "2026-09-29 every creature that starts or ends a titled quest has an entry, not only "
         "one that drops, sells or trains something: such a giver ships its name, ck, cd and st "
-        "the way a vendor does (its pins and side are EraPlaces.lua's). Object givers are not read.",
+        "the way a vendor does (its pins and side are EraPlaces.lua's). "
+        + (
+            "og: the quests a world OBJECT name starts and ends (gameobject_questrelation, "
+            "gameobject_involvedrelation, since 2026-10-22: a wanted poster, a sign), keyed by the "
+            "object name's index the way oi is and packed exactly as qg is; its own key because one "
+            "string can name a creature and an object both. Every quest here is titled by a c=3 row "
+            "or by qt; every name here has its id in oi (its pins are EraPlaces.lua's op). "
+            if table.object_givers
+            else ""
+        ),
         "st: the title under a vendor's, a trainer's or a quest giver's NAME "
         "(creature_template.SubName, such as Cooking Supplies), as an index into s, keyed the way "
         "ck is. Present only for the vendor names c=4 rows and lists use, the names tr and qg "
@@ -4444,6 +4648,26 @@ def header_lines(table: EraSources) -> list[str]:
             if table.quest_classes
             else []
         ),
+        *(
+            [
+                "qw: a repeatable quest that can only be taken while another quest is in the log, keyed "
+                "by quest id: that parent quest's id (quest_template.PrevQuestId below 0 on a quest "
+                f"whose SpecialFlags mark it repeatable). {counts.get('questHelpers', 0)} quests.",
+            ]
+            if table.quest_helpers
+            else []
+        ),
+        *(
+            [
+                "qo: the quests that come after a quest, keyed by quest id: one packed string, each later "
+                f"quest's id as {QG_QUEST_DIGITS} base 91 digits (as a qg list), ascending. A later quest is "
+                "one whose quest_template.PrevQuestId is the quest, or the quest's own NextQuestId or "
+                "NextQuestInChain, each above 0. "
+                f"{counts.get('questNextQuests', 0)} quests, {counts.get('questNextLinks', 0)} links.",
+            ]
+            if table.quest_next
+            else []
+        ),
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "
         "searched. x[itemId][c] is a 1 based number into xl, and xl holds each distinct list "
         "once. A list is a run of fixed width records of base 91 digits (the bytes 35 to 126 "
@@ -4469,8 +4693,15 @@ def header_lines(table: EraSources) -> list[str]:
         f"{counts.get('objectIds', 0)} object ids in oi, "
         f"{counts.get('questGiverNames', 0)} quest givers in qg ({counts.get('giverOnlyNames', 0)} "
         f"of them givers only; starts {counts.get('questGiverStarts', 0)}, ends "
-        f"{counts.get('questGiverEnds', 0)}, {counts.get('questGiverQuests', 0)} quests in all), and "
-        f"{counts.get('listEntries', 0)} further sources in "
+        f"{counts.get('questGiverEnds', 0)}, {counts.get('questGiverQuests', 0)} quests in all), "
+        + (
+            f"{counts.get('objectGiverNames', 0)} object quest givers in og (starts "
+            f"{counts.get('objectGiverStarts', 0)}, ends {counts.get('objectGiverEnds', 0)}, "
+            f"{counts.get('objectGiverQuests', 0)} quests in all), "
+            if table.object_givers
+            else ""
+        )
+        + f"and {counts.get('listEntries', 0)} further sources in "
         f"{counts.get('listsShipped', 0)} lists, stored as {counts.get('listsStored', 0)} "
         f"distinct packed strings; {counts.get('subnames', 0)} titles in st; "
         f"{counts.get('trainerNames', 0)} trainers in tr ({counts.get('trainerCreatures', 0)} "
