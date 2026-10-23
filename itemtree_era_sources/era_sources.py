@@ -77,6 +77,30 @@ only and nothing else read. So a step whose next quest has another title still h
 Legends of Maraudon (7044) leads on to The Scepter of Celebras (7046, PrevQuestId 7044), which `qc`
 cannot say.
 
+Since 2026-10-23 (brief NX2, on the owner's word of 2026-10-23: "It's probably okay to add chain columns
+to the file as well") `qo` holds two more kinds of later step, out of two more `quest_template` columns
+and four number columns of one more table, ids and numbers only. `RequiredCondition` names a row of the
+`conditions` table, of which `condition_entry`, `type`, `value1`, `value2` and `flags` are read (never
+`comments`), and only for the rows that join conditions (AND, type -1, and OR, type -2, `value1` and
+`value2` naming two more rows) and the rows that ask for a quest rewarded (type 8, `value1` the quest): a
+quest whose `RequiredCondition` asks for the quest rewarded, through AND and OR rows alone, is a later
+step of it. A NOT row (type -3) or a row whose `flags` reverses its answer (bit 1) is never walked into,
+so a quest that asks for another NOT rewarded is no step of it. March of the Silithid (4493) asks for
+either Rise of the Silithid (4267 or 162) rewarded, so it comes after both. And `BreadcrumbForQuestId`
+names the quest a breadcrumb leads to, which counts as the breadcrumb's later step: Deliveries to Sven
+(164) leads to Sven's Revenge (95). Neither is a step `qc` numbers by: its chains stay the three link
+columns' alone (quest_successors).
+
+Since 2026-10-22 (brief NX1, on the owner's ruling "2A" of 2026-10-22: ship the Classic Era provided
+items) two more `quest_template` columns are read, `SrcItemId` and `SrcItemCount`: the item a quest
+hands the player when it is taken, and how many. They ship as `qp`, keyed by quest id, each value one
+`qr` record (the item id, then the count), ids and counts only and nothing else read: Saving Yenniku
+(592) hands over the Soul Gem (3912). Only a titled quest that is no scaffolding, and only an item this
+build ships (or withholds), as `qr`'s rule is; a `qp` quest nothing else titles gets its title in `qt`
+the way a `qr` one does. Every such pair ships, an item that also starts its own quest among them: the
+caller's addon leaves that one out where it reads `qp` (the brief's rule, which reads the client's own
+item rows and so has no place in this file).
+
 Since 2026-10-22 (brief EO1, on the owner's ruling "3A" of 2026-10-22) the world OBJECTS that start
 and end quests are read the same way: `gameobject_questrelation` (which object starts a quest) and
 `gameobject_involvedrelation` (which ends one), two id columns each and nothing else, so a wanted
@@ -1128,6 +1152,18 @@ class EraInput:
     # questId -> (PrevQuestId, NextQuestId, NextQuestInChain), for every entry with one non zero.
     # Ids only. Read to number the quests of one chain that share a title (quest_chains).
     quest_links: dict[int, tuple[int, int, int]] = field(default_factory=dict)
+    # Brief NX1 (the owner's ruling "2A" of 2026-10-22): quest_template's SrcItemId and SrcItemCount,
+    # questId -> (the item the quest hands the player when it is taken, how many; a count of 0 read as
+    # 1), for every entry whose SrcItemId is above 0. Ids and counts only. Shipped as `qp`.
+    quest_sources: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Brief NX2 (the owner's word of 2026-10-23): quest_template's RequiredCondition, questId -> the
+    # `conditions` row it names, and its BreadcrumbForQuestId, questId -> the quest the breadcrumb leads
+    # to, each for every entry with one above 0; and the `conditions` rows themselves, condition_entry ->
+    # (type, value1, value2, flags), for the AND (-1), OR (-2), NOT (-3) and quest rewarded (8) rows
+    # alone. Ids and numbers only. Read for qo's later steps (quest_later_steps).
+    quest_conditions: dict[int, int] = field(default_factory=dict)
+    quest_breadcrumbs: dict[int, int] = field(default_factory=dict)
+    conditions: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
     # Brief P6a, the trainers. `trainer_spells` is `npc_trainer` as (creature id, spell id) and
     # `trainer_template_spells` is `npc_trainer_template` as (template id, spell id), both in the
     # dump's order; `learned_spells` is spell_template's learn spells, spell id -> the spell it
@@ -1210,6 +1246,10 @@ CMANGOS_FIELDS = frozenset(
         "object_quest_starts",
         "object_quest_ends",
         "quest_links",
+        "quest_sources",
+        "quest_conditions",
+        "quest_breadcrumbs",
+        "conditions",
         "trainer_spells",
         "trainer_template_spells",
         "learned_spells",
@@ -1372,8 +1412,13 @@ class EraSources:
     # another is in the log (PrevQuestId < 0) -> that parent quest (quest_helpers). Shipped as `qw`.
     quest_helpers: dict[int, int] = field(default_factory=dict)
     # Brief PL1 (the owner's ruling "B" of 2026-10-22): questId -> the quests that come after it (its
-    # chain links, quest_successors), packed by pack_quests. Shipped as `qo`.
+    # chain links, quest_successors; since brief NX2 also its RequiredCondition and breadcrumb steps,
+    # quest_later_steps), packed by pack_quests. Shipped as `qo`.
     quest_next: dict[int, str] = field(default_factory=dict)
+    # Brief NX1 (the owner's ruling "2A" of 2026-10-22): questId -> the item it hands the player when
+    # it is taken and how many (quest_template.SrcItemId and SrcItemCount), one record packed by
+    # pack_requires, as a `qr` record is. Shipped as `qp`.
+    quest_provided: dict[int, str] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     dropped: dict[str, int] = field(default_factory=dict)
     # Brief EK1, for the caller that places the names (never shipped): which names the table opens
@@ -1446,6 +1491,9 @@ class EraSources:
         # Brief PL1: the quests that come after each quest, absent where none ships.
         if self.quest_next:
             value["qo"] = dict(self.quest_next)
+        # Brief NX1: the item each quest hands the player when it is taken, absent where none ships.
+        if self.quest_provided:
+            value["qp"] = dict(self.quest_provided)
         if generated:
             value["g"] = generated
         check_gpl_value(value, self.blank)
@@ -1460,11 +1508,15 @@ class EraSources:
 # reads the creature ones), on the owner's ruling "3A" of 2026-10-22. Brief IW1 adds `qw`, a repeatable
 # helper quest's parent (quest_template.PrevQuestId below 0), on the owner's ruling "B" of 2026-10-22.
 # Brief PL1 adds `qo`, the quests that come after a quest (quest_template.PrevQuestId, NextQuestId and
-# NextQuestInChain above 0), on the owner's ruling "B" of 2026-10-22 (the prerequisite links).
+# NextQuestInChain above 0), on the owner's ruling "B" of 2026-10-22 (the prerequisite links); brief NX2
+# widens it with quest_template.RequiredCondition (the conditions rows asking for a quest rewarded) and
+# BreadcrumbForQuestId, on the owner's word of 2026-10-23 ("It's probably okay to add chain columns").
+# Brief NX1 adds `qp`, the item a quest hands the player when it is taken (quest_template.SrcItemId and
+# SrcItemCount), on the owner's ruling "2A" of 2026-10-22 (the Classic Era provided items).
 GPL_FIELDS = frozenset(
     {
         *("s", "r", "qt", "ck", "cd", "ci", "oi", "qg", "og", "st", "tr", "tv", "tc", "qr"),
-        *("qc", "qe", "ql", "qa", "qw", "qo", "x", "xl", "g"),
+        *("qc", "qe", "ql", "qa", "qw", "qo", "qp", "x", "xl", "g"),
     }
 )
 # The keys a packed module adds beside them (pack_module).
@@ -1620,6 +1672,10 @@ WANTED_TABLES = (
     "spell_template",
     # Brief Q1: which game event a quest belongs to. Two columns, both ids.
     "game_event_quest",
+    # Brief NX2 (the owner's word of 2026-10-23): the condition rows a quest's RequiredCondition names,
+    # four number columns (condition_entry, type, value1, value2) and flags, of the AND, OR and quest
+    # rewarded rows alone; never the comments.
+    "conditions",
 )
 
 LOOT_TABLES = {
@@ -2046,6 +2102,18 @@ def _absorb(
             pair
         )
         return
+    if table == "conditions":
+        # Brief NX2: an AND, OR or NOT row, or one that asks for a quest rewarded; four numbers and the
+        # flags. Every other kind of row (an aura, an item, a level, ...) is dropped unread.
+        kind = _int(col("type"))
+        if kind in CONDITION_KINDS_READ:
+            era.conditions[_int(col("condition_entry"))] = (
+                kind,
+                _int(col("value1")),
+                _int(col("value2")),
+                _int(col("flags")),
+            )
+        return
     if table == "game_event_quest":
         # Brief Q1: a quest and a game event it belongs to, two ids.
         quest = _int(col("quest"))
@@ -2064,6 +2132,19 @@ def _absorb(
             links = (_int(col("PrevQuestId")), _int(col("NextQuestId")), _int(col("NextQuestInChain")))
             if any(links):
                 era.quest_links[qid] = links
+            # Brief NX1, the owner's ruling "2A" of 2026-10-22: the item the quest hands over when it
+            # is taken, and how many, ids and counts only.
+            source = _int(col("SrcItemId"))
+            if source > 0:
+                era.quest_sources[qid] = (source, max(1, _int(col("SrcItemCount"))))
+            # Brief NX2, the owner's word of 2026-10-23: the condition row the quest asks to hold before
+            # it can be taken, and the quest a breadcrumb leads to, ids only.
+            condition = _int(col("RequiredCondition"))
+            if condition > 0:
+                era.quest_conditions[qid] = condition
+            breadcrumb = _int(col("BreadcrumbForQuestId"))
+            if breadcrumb > 0:
+                era.quest_breadcrumbs[qid] = breadcrumb
         fixed: list[int] = []
         for key in ("RewItemId1", "RewItemId2", "RewItemId3", "RewItemId4"):
             value = _int(col(key))
@@ -3433,6 +3514,39 @@ def _quest_requires(
     return out
 
 
+def quest_provided(
+    era_input: CmangosFacts,
+    shipped: Callable[[int], bool],
+    counts: dict[str, int],
+    dropped: dict[str, int],
+) -> dict[int, tuple[int, int]]:
+    """questId -> (item id, count): the item the quest hands the player when it is taken (brief NX1,
+    the owner's ruling "2A" of 2026-10-22), out of quest_template's SrcItemId and SrcItemCount alone.
+
+    Saving Yenniku (592) hands over the Soul Gem (3912) to be filled. Only a quest `quest_template`
+    titles, never one whose title is scaffolding (refused like a `qr` quest), and only an item this
+    build ships or withholds (`shipped`, as `qr`'s rule): any other pair is counted in `dropped`.
+    A count of 0 reads as 1. Every such pair is kept, an item that also starts its own quest among
+    them (the caller's addon leaves that one out where it reads `qp`). Ids and counts only. Pure."""
+    out: dict[int, tuple[int, int]] = {}
+    for quest_id, (item, count) in sorted(era_input.quest_sources.items()):
+        title = era_input.quest_names.get(quest_id, "")
+        if not title:
+            dropped["questProvidedUntitled"] += 1
+            continue
+        if is_scaffolding(title):
+            dropped["questProvidedScaffolding"] += 1
+            continue
+        if not shipped(item):
+            dropped["questProvidedNotShipped"] += 1
+            continue
+        out[quest_id] = (item, max(1, count))
+    counts["questProvidedQuests"] = len(out)
+    counts["questProvidedItems"] = len({item for item, _count in out.values()})
+    counts["questProvidedCountAboveOne"] = sum(1 for _item, count in out.values() if count > 1)
+    return out
+
+
 def _vendor_creatures(era_input: CmangosFacts) -> set[int]:
     """Every creature id that sells anything, by `npc_vendor` or by a vendor template."""
     found = {offer.vendor for offer in era_input.vendor_offers}
@@ -3794,6 +3908,9 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         "classTrainerNoClass": 0,
         "questRequiresNotShipped": 0,
         "questRequiresScaffolding": 0,
+        "questProvidedUntitled": 0,
+        "questProvidedScaffolding": 0,
+        "questProvidedNotShipped": 0,
     }
     counts: dict[str, int] = {
         "multiQuest": 0,
@@ -3941,6 +4058,11 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     requires = _quest_requires(
         era_input, lambda item: item in selected.items or item in withheld_ids, counts, dropped
     )
+    # Brief NX1 (the owner's ruling "2A" of 2026-10-22): the item each kept quest hands the player when
+    # it is taken, by the same rule for the item (shipped or withheld). Titled with qr's quests below.
+    provided = quest_provided(
+        era_input, lambda item: item in selected.items or item in withheld_ids, counts, dropped
+    )
     # Brief T1, the owner's ruling of 2026-09-27: the title under the name, for the vendors and
     # the quest givers and enders the table names, and no other creature (the caller's side for
     # the same names, EraPlaces.lua's `cf`, is read by the same speaking_creatures rule).
@@ -3990,6 +4112,23 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
             by_string += 1
     counts["questRequiresTitlesByIndex"] = by_index
     counts["questRequiresTitlesByString"] = by_string
+    # Brief NX1: a qp quest nothing above titles gets its title in qt by the same rule (an index where
+    # `s` holds the very string, else the title itself), so its Provided items rows can name it.
+    by_index = 0
+    by_string = 0
+    for quest in provided:
+        if quest in handed_over or quest in quest_titles:
+            continue
+        title = era_input.quest_names[quest]
+        index = strings.find(title)
+        if index:
+            quest_titles[quest] = index
+            by_index += 1
+        else:
+            quest_titles[quest] = title
+            by_string += 1
+    counts["questProvidedTitlesByIndex"] = by_index
+    counts["questProvidedTitlesByString"] = by_string
     # Brief QN1: the quests of one chain that share a title, numbered by chain position.
     chains = quest_chains(era_input.quest_names, era_input.quest_links, era_input.quest_ids)
     agree, disagree = chains.id_order_check()
@@ -4008,10 +4147,21 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
     # Brief IW1 (the owner's ruling "B" of 2026-10-22): the repeatable helper quests and their parents.
     helpers = quest_helpers(era_input)
     counts["questHelpers"] = len(helpers)
-    # Brief PL1 (the owner's ruling "B" of 2026-10-22): the quests that come after each quest.
-    later = quest_successors(era_input.quest_links, era_input.quest_ids, era_input.quest_names)
+    # Brief PL1 (the owner's ruling "B" of 2026-10-22): the quests that come after each quest. Brief NX2
+    # (the owner's word of 2026-10-23): and the quests whose RequiredCondition asks for one rewarded, and
+    # the quest each breadcrumb leads to.
+    later, by_condition, by_breadcrumb = quest_later_steps(
+        era_input.quest_links,
+        era_input.quest_ids,
+        era_input.quest_names,
+        quest_conditions=era_input.quest_conditions,
+        conditions=era_input.conditions,
+        breadcrumbs=era_input.quest_breadcrumbs,
+    )
     counts["questNextQuests"] = len(later)
     counts["questNextLinks"] = sum(len(quests) for quests in later.values())
+    counts["questNextByCondition"] = by_condition
+    counts["questNextByBreadcrumb"] = by_breadcrumb
 
     # Brief W15: the names a list record packs go first, so their two digit field always fits.
     listed_names = {
@@ -4145,6 +4295,7 @@ def derive(cmangos: CmangosOnly, selected: BuildFacts) -> EraSources:
         quest_classes=dict(sorted(era_input.quest_classes.items())),
         quest_helpers=helpers,
         quest_next={quest: pack_quests(quests) for quest, quests in later.items()},
+        quest_provided={quest: pack_requires([pair]) for quest, pair in sorted(provided.items())},
         list_index={
             item: dict(sorted(by_kind_rows.items())) for item, by_kind_rows in sorted(list_index.items())
         },
@@ -4203,7 +4354,8 @@ def quest_successors(
 ) -> dict[int, tuple[int, ...]]:
     """The quests that come after each quest, out of `quest_template`'s three chain link columns
     (brief QN1's rule for a step, which quest_chains numbers by; since brief PL1, the owner's ruling
-    "B" of 2026-10-22, it also ships as `qo`): questId -> the later quest ids, ascending, in quest id
+    "B" of 2026-10-22, it also ships in `qo`, beside brief NX2's two more kinds of step:
+    quest_later_steps): questId -> the later quest ids, ascending, in quest id
     order, for every quest with one. A positive `PrevQuestId` makes the quest a later one of that
     quest; a positive `NextQuestId` or `NextQuestInChain` names a later one of the quest itself. A
     negative link (a quest that must be in the log at the same time) is no step, and a link to itself
@@ -4220,6 +4372,82 @@ def quest_successors(
             if later > 0 and later in known and later != quest:
                 succ[quest].add(later)
     return {quest: tuple(sorted(succ[quest])) for quest in sorted(succ)}
+
+
+# Brief NX2 (the owner's word of 2026-10-23): the CMaNGOS `conditions` row kinds qo's later steps read.
+# AND and OR name two more rows (value1, value2), NOT one (value1); a quest rewarded row names its quest
+# (value1). A row whose flags hold CONDITION_REVERSED answers the opposite, as a NOT does.
+CONDITION_AND = -1
+CONDITION_OR = -2
+CONDITION_NOT = -3
+CONDITION_QUEST_REWARDED = 8
+CONDITION_KINDS_READ = frozenset({CONDITION_AND, CONDITION_OR, CONDITION_NOT, CONDITION_QUEST_REWARDED})
+CONDITION_REVERSED = 1
+# How deep a condition tree is walked; the dump's deepest is a handful of rows.
+CONDITION_DEPTH = 32
+
+
+def condition_quests_rewarded(conditions: Mapping[int, tuple[int, int, int, int]], entry: int) -> set[int]:
+    """The quests a `conditions` row asks for rewarded (brief NX2, the owner's word of 2026-10-23): a
+    quest rewarded row's quest (type 8, value1), and through AND and OR rows (types -1 and -2, value1 and
+    value2) every such row below them. A NOT row (type -3) and a row whose flags reverse its answer are
+    never walked into, so a quest asked for NOT rewarded is never among them, and neither is anything
+    under a NOT. A row the table does not hold, a loop and a tree deeper than CONDITION_DEPTH stop the
+    walk there. Ids only. Pure."""
+    out: set[int] = set()
+    seen: set[int] = set()
+    stack = [(entry, 0)]
+    while stack:
+        at, depth = stack.pop()
+        row = conditions.get(at)
+        if row is None or at in seen or depth > CONDITION_DEPTH:
+            continue
+        seen.add(at)
+        kind, first, second, flags = row
+        if flags & CONDITION_REVERSED:
+            continue
+        if kind == CONDITION_QUEST_REWARDED and first > 0:
+            out.add(first)
+        elif kind in (CONDITION_AND, CONDITION_OR):
+            stack += [(first, depth + 1), (second, depth + 1)]
+    return out
+
+
+def quest_later_steps(
+    links: Mapping[int, tuple[int, int, int]],
+    quest_ids: Collection[int] = (),
+    names: Collection[int] = (),
+    *,
+    quest_conditions: Mapping[int, int] | None = None,
+    conditions: Mapping[int, tuple[int, int, int, int]] | None = None,
+    breadcrumbs: Mapping[int, int] | None = None,
+) -> tuple[dict[int, tuple[int, ...]], int, int]:
+    """The quests that come after each quest, as `qo` ships them: quest_successors' chain links (brief
+    PL1), and since brief NX2 (the owner's word of 2026-10-23) two more kinds of step. A quest whose
+    `RequiredCondition` asks for the quest rewarded (condition_quests_rewarded: through AND and OR, never
+    NOT) comes after it, and a breadcrumb's `BreadcrumbForQuestId` comes after the breadcrumb. A link to
+    itself or to an id `quest_template` does not hold is dropped, as quest_successors drops one. Returns
+    (questId -> the later quest ids, ascending, for every quest with one; the condition links and the
+    breadcrumb links the chain links do not already hold). Ids only. Pure."""
+    known = set(quest_ids) or (set(names) | set(links))
+    succ: dict[int, set[int]] = defaultdict(set)
+    for quest, later in quest_successors(links, quest_ids, names).items():
+        succ[quest].update(later)
+    by_condition = by_breadcrumb = 0
+    tree = conditions or {}
+    for quest, entry in sorted((quest_conditions or {}).items()):
+        if quest not in known:
+            continue
+        for earlier in sorted(condition_quests_rewarded(tree, entry)):
+            if earlier in known and earlier != quest and quest not in succ[earlier]:
+                succ[earlier].add(quest)
+                by_condition += 1
+    for quest, target in sorted((breadcrumbs or {}).items()):
+        if quest in known and target in known and target != quest and target not in succ[quest]:
+            succ[quest].add(target)
+            by_breadcrumb += 1
+    later = {quest: tuple(sorted(succ[quest])) for quest in sorted(succ) if succ[quest]}
+    return later, by_condition, by_breadcrumb
 
 
 def quest_chains(
@@ -4465,6 +4693,7 @@ def header_lines(table: EraSources) -> list[str]:
         + ("qa = { [questId] = class mask }, " if table.quest_classes else "")
         + ("qw = { [questId] = parent questId }, " if table.quest_helpers else "")
         + ("qo = { [questId] = the quests that come after it, packed }, " if table.quest_next else "")
+        + ("qp = { [questId] = the item it hands over when taken, packed }, " if table.quest_provided else "")
         + "legend = { {field, type}, ... }, packed = 1, g = the Generated stamp above }",
         "r[itemId] is a LIST of rows, in the order to draw them: category ascending, best "
         "chance first inside a category, the summary row last. Never sort it. A herb or a vein "
@@ -4520,7 +4749,8 @@ def header_lines(table: EraSources) -> list[str]:
         "qt: the title of a quest an o row names in q, a qg list names or qr carries, for the "
         "quests no c=3 row names anywhere in the table. A value is a NUMBER, an index into s, or "
         "(only for a qr quest whose title s does not hold) a STRING, the title itself: test the "
-        "type. Titles only, and the addon reads its own quest index first.",
+        "type. Titles only, and the addon reads its own quest index first."
+        + (" A qp quest is titled by the same rule as a qr one." if table.quest_provided else ""),
         "ck: what kind of creature a NAME is, one integer per name: CreatureType + "
         f"{KIND_TYPE_SPAN} * (MinLevel + {KIND_LEVEL_SPAN} * (MaxLevel less MinLevel + "
         f"{KIND_BAND_SPAN} * beast Family)). Present for the names c=1, 6, 7 and 12 rows and "
@@ -4662,10 +4892,28 @@ def header_lines(table: EraSources) -> list[str]:
                 "qo: the quests that come after a quest, keyed by quest id: one packed string, each later "
                 f"quest's id as {QG_QUEST_DIGITS} base 91 digits (as a qg list), ascending. A later quest is "
                 "one whose quest_template.PrevQuestId is the quest, or the quest's own NextQuestId or "
-                "NextQuestInChain, each above 0. "
-                f"{counts.get('questNextQuests', 0)} quests, {counts.get('questNextLinks', 0)} links.",
+                "NextQuestInChain, each above 0; one whose RequiredCondition asks for the quest rewarded "
+                "(a conditions row of type 8, through AND and OR rows, never NOT or a reversed row); or the "
+                "quest's own BreadcrumbForQuestId. "
+                f"{counts.get('questNextQuests', 0)} quests, {counts.get('questNextLinks', 0)} links "
+                f"({counts.get('questNextByCondition', 0)} by RequiredCondition and "
+                f"{counts.get('questNextByBreadcrumb', 0)} by BreadcrumbForQuestId beyond the chain links).",
             ]
             if table.quest_next
+            else []
+        ),
+        *(
+            [
+                "qp: the item a quest hands the player when it is taken (quest_template.SrcItemId and "
+                "SrcItemCount), keyed by quest id: one packed string, one qr record (the item id in "
+                f"{QR_ITEM_DIGITS} base 91 digits, then how many in {QR_COUNT_DIGITS}). Only items this "
+                "build ships (or withholds); an item that also starts the quest is kept here and left out "
+                "by the reader. Every quest here is titled by a c=3 row or by qt. "
+                f"{counts.get('questProvidedQuests', 0)} quests, {counts.get('questProvidedItems', 0)} "
+                f"items ({counts.get('questProvidedTitlesByIndex', 0)} titled in qt by index, "
+                f"{counts.get('questProvidedTitlesByString', 0)} by string).",
+            ]
+            if table.quest_provided
             else []
         ),
         "x, xl: the rest of the list a summary row stands for, so it can be opened and "
