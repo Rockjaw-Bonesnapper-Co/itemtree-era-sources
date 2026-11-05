@@ -314,19 +314,32 @@ LICENCE_NOTE_FACTS = (
 CORRESPONDING_SOURCE_URL = "https://github.com/Rockjaw-Bonesnapper-Co/itemtree-era-sources"
 
 
-def gpl_declaration(*, what: str, rest: str, source: str) -> str:
+# The upstream a GPL file's declaration names by default: the Classic Era files' one.
+DECLARED_UPSTREAM = "the CMaNGOS Classic content database it derives from (github.com/cmangos/classic-db)"
+
+
+def gpl_declaration(
+    *,
+    what: str,
+    rest: str,
+    source: str,
+    upstream: str = DECLARED_UPSTREAM,
+    corresponding_source: str = CORRESPONDING_SOURCE_URL,
+) -> str:
     """THE one place a GPL-3.0 declaration is written (brief GA1, owner ruling of 2026-10-09).
 
     Only the mirrored modules call it (tests/test_gpl_guards.py fails on any other caller, and on
     the licence's name written anywhere else in the pipeline), and only for a file that holds
-    nothing but what the pinned CMaNGOS dump and pfQuest's area ids give. `what` names the file
-    ("This one generated file"), `rest` says what around it is all rights reserved, `source` what
-    the Corresponding Source holds.
+    nothing but what one pinned upstream gives: the CMaNGOS dump and pfQuest's area ids (the
+    Classic Era files, the defaults), or since brief QZ2 the pinned QuestieDB commit
+    (open_sources.py's OpenSources.lua, which passes its own `upstream` and its own
+    `corresponding_source`). `what` names the file ("This one generated file"), `rest` says what
+    around it is all rights reserved, `source` what the Corresponding Source holds.
     """
     return (
         f"{what} is distributed under the GNU General Public License version 3, the licence of "
-        "the CMaNGOS Classic content database it derives from (github.com/cmangos/classic-db). "
-        f"{rest} Corresponding Source, as GPL-3.0 section 6(d) asks: {CORRESPONDING_SOURCE_URL} "
+        f"{upstream}. "
+        f"{rest} Corresponding Source, as GPL-3.0 section 6(d) asks: {corresponding_source} "
         f"({source})."
     )
 
@@ -376,17 +389,31 @@ def licence_note() -> str:
 
 
 def gpl_licence_lines(
-    *, what: str, rest: str, source: str, licence_files: str = LICENCE_FILES, pfquest: bool = True
+    *,
+    what: str,
+    rest: str,
+    source: str,
+    licence_files: str = LICENCE_FILES,
+    pfquest: bool = True,
+    upstream: str = DECLARED_UPSTREAM,
+    corresponding_source: str = CORRESPONDING_SOURCE_URL,
+    upstream_lines: Sequence[str] | None = None,
+    modification: str = MODIFICATION_NOTICE,
 ) -> list[str]:
     """Every licence line of a GPL-3.0 generated file, the declaration (gpl_declaration) first, then
     the upstream commits and notices, the section 5(a) modification notice and where the licence
     files ship. The one helper the mirrored writers make a GPL header with (brief GA1). `pfquest`
-    is whether the file reads pfQuest's area ids at all."""
-    upstream = [UPSTREAM_CMANGOS, CMANGOS_COPYRIGHT, *([UPSTREAM_PFQUEST] if pfquest else [])]
+    is whether the file reads pfQuest's area ids at all. A file of another upstream (brief QZ2:
+    open_sources.py) passes that upstream's declaration words, Corresponding Source, notice lines and
+    modification notice; left out, each is the Classic Era files' own, so their headers never move."""
+    if upstream_lines is None:
+        upstream_lines = [UPSTREAM_CMANGOS, CMANGOS_COPYRIGHT, *([UPSTREAM_PFQUEST] if pfquest else [])]
     return [
-        gpl_declaration(what=what, rest=rest, source=source),
-        *upstream,
-        MODIFICATION_NOTICE,
+        gpl_declaration(
+            what=what, rest=rest, source=source, upstream=upstream, corresponding_source=corresponding_source
+        ),
+        *upstream_lines,
+        modification,
         licence_files,
     ]
 
